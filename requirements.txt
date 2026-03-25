@@ -1,0 +1,32 @@
+# NL-BI Dashboard - Python Dependencies
+# ======================================
+
+# Core Framework
+langchain>=1.2.0
+langchain-community>=0.4.0
+langchain-openai>=1.1.0
+langchain-core>=1.2.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Security & Parsing
+sqlparse>=0.5.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization (for future UI)
+plotly>=5.18.0
+
+# UI Framework (for future UI)
+streamlit>=1.28.0
+
+# OpenAI API (for LLM)
+openai>=1.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
