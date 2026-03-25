@@ -61,11 +61,11 @@ pip install -r requirements.txt
 python database_setup.py
 ```
 
-### 3. Configure API Key
+### 3. Configure LLM Provider
 
 ```bash
 cp .env.example .env
-# Edit .env and add your OpenAI API key
+# Edit .env and configure your LLM provider
 ```
 
 ### 4. Test SQL Chain
@@ -79,6 +79,91 @@ python -c "
 from sql_chain import run_query, format_result_summary
 result = run_query('Show me the top 5 customers by total order amount')
 print(format_result_summary(result))
+"
+```
+
+## 🤖 LLM Configuration
+
+The NL-BI Dashboard supports **any OpenAI-compatible endpoint**, giving you complete flexibility in choosing your LLM provider.
+
+### Supported Providers
+
+| Provider | Type | Endpoint | Notes |
+|----------|------|----------|-------|
+| **OpenAI** | Cloud | Default | GPT-4o recommended |
+| **Ollama** | Local | `http://localhost:11434/v1` | Free, runs locally |
+| **LM Studio** | Local | `http://localhost:1234/v1` | GUI-based local LLM |
+| **vLLM** | Local | `http://localhost:8000/v1` | High-performance serving |
+| **Groq** | Cloud | `https://api.groq.com/openai/v1` | Ultra-fast inference |
+| **Together AI** | Cloud | `https://api.together.xyz/v1` | Open-source models |
+| **Azure OpenAI** | Cloud | Your Azure endpoint | Enterprise integration |
+
+### Configuration Methods
+
+#### Method 1: Environment Variables
+
+```bash
+# For OpenAI
+export OPENAI_API_KEY="sk-your-key-here"
+
+# For custom endpoints (e.g., Ollama)
+export LLM_API_KEY="ollama"
+export LLM_BASE_URL="http://localhost:11434/v1"
+export LLM_MODEL="llama3"
+```
+
+#### Method 2: Using Predefined Providers
+
+```python
+from sql_chain import run_query
+
+# Use predefined provider
+result = run_query("Show top customers", provider="ollama")
+```
+
+#### Method 3: Custom Configuration
+
+```python
+from sql_chain import run_query, LLMConfig, get_llm
+
+# Create custom config
+config = LLMConfig(
+    base_url="http://localhost:8000/v1",
+    model="llama3",
+    api_key="dummy"
+)
+
+# Use with run_query
+result = run_query("Total revenue by category", config=config)
+
+# Or create LLM directly
+llm = get_llm(
+    base_url="https://api.groq.com/openai/v1",
+    model="llama-3.1-70b-versatile",
+    api_key="gsk_xxxx"
+)
+```
+
+### Example: Using Ollama Locally
+
+```bash
+# 1. Install and run Ollama
+# See: https://ollama.ai
+
+# 2. Pull a model
+ollama pull llama3
+
+# 3. Configure environment
+export LLM_API_KEY="ollama"
+export LLM_BASE_URL="http://localhost:11434/v1"
+export LLM_MODEL="llama3"
+
+# 4. Run queries
+python -c "
+from sql_chain import run_query
+result = run_query('What is the total revenue?')
+print(result.sql_query)
+print(result.dataframe)
 "
 ```
 
@@ -103,15 +188,18 @@ conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
 
 ## 📋 API Reference
 
-### `run_query(user_question, llm=None, api_key=None, model="gpt-4o")`
+### `run_query(user_question, **options)`
 
 Execute a natural language query against the database.
 
 **Parameters:**
 - `user_question` (str): Natural language question
 - `llm` (BaseChatModel, optional): Pre-configured LLM instance
-- `api_key` (str, optional): OpenAI API key
+- `api_key` (str, optional): API key for the LLM provider
+- `base_url` (str, optional): Custom API endpoint URL
 - `model` (str): Model name (default: "gpt-4o")
+- `config` (LLMConfig, optional): Complete configuration object
+- `provider` (str, optional): Predefined provider name
 
 **Returns:** `QueryResult` dataclass with:
 - `success` (bool): Whether query succeeded
@@ -120,23 +208,38 @@ Execute a natural language query against the database.
 - `error_message` (str): Error if failed
 - `retry_count` (int): Number of retries used
 
+### `get_llm(**options)`
+
+Create an LLM instance with flexible configuration.
+
 ### `validate_sql(query)`
 
 Validate SQL query for security compliance.
 
-**Parameters:**
-- `query` (str): SQL query to validate
+### `LLMConfig`
 
-**Returns:** `SQLValidationResult` with validation status and details.
+Configuration dataclass for LLM settings.
+
+```python
+from sql_chain import LLMConfig
+
+config = LLMConfig(
+    api_key="your-key",
+    base_url="http://localhost:11434/v1",
+    model="llama3",
+    temperature=0.0,
+    max_tokens=2000
+)
+```
 
 ## 🧪 Testing
 
 ```bash
 # Run all tests
-python -m pytest tests/ -v
-
-# Run validation tests only
 python sql_chain.py
+
+# Run with specific provider
+LLM_API_KEY=ollama LLM_BASE_URL=http://localhost:11434/v1 LLM_MODEL=llama3 python sql_chain.py
 ```
 
 ## 📈 Roadmap
@@ -145,6 +248,7 @@ python sql_chain.py
 - [x] Database setup with sample data
 - [x] Security validation layer
 - [x] LangChain SQL chain
+- [x] OpenAI-compatible endpoint support
 - [ ] Streamlit UI
 - [ ] Plotly visualization
 

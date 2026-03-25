@@ -25,7 +25,7 @@ import sqlparse
 import pandas as pd
 import os
 from typing import Optional, Tuple, Dict, Any, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 # LangChain imports
@@ -63,6 +63,102 @@ MAX_RETRIES = 2
 
 # SQL statement types that are allowed
 ALLOWED_STATEMENT_TYPES = {"SELECT"}
+
+
+# =============================================================================
+# LLM Configuration (OpenAI-Compatible Endpoints)
+# =============================================================================
+
+@dataclass
+class LLMConfig:
+    """
+    Configuration for LLM connections supporting any OpenAI-compatible endpoint.
+    
+    This allows using:
+    - OpenAI (default)
+    - Azure OpenAI
+    - Local LLMs (Ollama, LM Studio, vLLM)
+    - Other providers (Together AI, Groq, Anyscale, etc.)
+    
+    Environment Variables (in order of priority):
+        LLM_API_KEY / OPENAI_API_KEY - API key
+        LLM_BASE_URL - Base URL for API endpoint
+        LLM_MODEL - Model name to use
+    """
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    model: str = "gpt-4o"
+    temperature: float = 0.0
+    max_tokens: int = 2000
+    
+    def __post_init__(self):
+        """Load from environment variables if not explicitly set."""
+        # API Key: Check LLM_API_KEY first, then OPENAI_API_KEY for backward compatibility
+        if self.api_key is None:
+            self.api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        
+        # Base URL: For custom endpoints (Ollama, vLLM, etc.)
+        if self.base_url is None:
+            self.base_url = os.environ.get("LLM_BASE_URL")
+        
+        # Model: Allow override via environment
+        env_model = os.environ.get("LLM_MODEL")
+        if env_model:
+            self.model = env_model
+    
+    @classmethod
+    def from_env(cls) -> "LLMConfig":
+        """Create configuration from environment variables."""
+        return cls()
+    
+    def validate(self) -> Tuple[bool, str]:
+        """Validate configuration."""
+        if not self.api_key:
+            return False, "No API key configured. Set LLM_API_KEY or OPENAI_API_KEY environment variable."
+        return True, ""
+    
+    def get_provider_info(self) -> str:
+        """Return human-readable provider information."""
+        if self.base_url:
+            if "localhost" in self.base_url or "127.0.0.1" in self.base_url:
+                return f"Local LLM at {self.base_url}"
+            return f"Custom endpoint: {self.base_url}"
+        return "OpenAI (default)"
+
+
+# Predefined configurations for common providers
+LLM_PROVIDERS = {
+    "openai": LLMConfig(
+        base_url=None,  # Uses default OpenAI endpoint
+        model="gpt-4o"
+    ),
+    "ollama": LLMConfig(
+        base_url="http://localhost:11434/v1",
+        model="llama3",
+        api_key="ollama"  # Ollama doesn't need a real API key
+    ),
+    "lm-studio": LLMConfig(
+        base_url="http://localhost:1234/v1",
+        model="local-model",
+        api_key="lm-studio"
+    ),
+    "groq": LLMConfig(
+        base_url="https://api.groq.com/openai/v1",
+        model="llama-3.1-70b-versatile"
+    ),
+    "together": LLMConfig(
+        base_url="https://api.together.xyz/v1",
+        model="meta-llama/Llama-3-70b-chat-hf"
+    ),
+    "azure": LLMConfig(
+        # Azure requires additional setup, base_url should be your Azure endpoint
+        model="gpt-4o"
+    ),
+    "vllm": LLMConfig(
+        base_url="http://localhost:8000/v1",
+        model="auto"
+    ),
+}
 
 
 # =============================================================================
@@ -281,37 +377,95 @@ When the user asks a question, generate a single, valid SQLite SELECT query that
 Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
 
 
-def get_llm(api_key: Optional[str] = None, model: str = "gpt-4o", temperature: float = 0.0) -> BaseChatModel:
+def get_llm(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: str = "gpt-4o",
+    temperature: float = 0.0,
+    config: Optional[LLMConfig] = None,
+    provider: Optional[str] = None
+) -> BaseChatModel:
     """
     Get the LLM instance for SQL generation.
     
-    This function creates a LangChain ChatOpenAI instance configured for
-    SQL generation tasks. You can configure the model and API key.
+    Supports any OpenAI-compatible endpoint including:
+    - OpenAI (default)
+    - Azure OpenAI
+    - Local LLMs: Ollama, LM Studio, vLLM
+    - Other providers: Together AI, Groq, Anyscale, etc.
     
     Args:
-        api_key: OpenAI API key (will use OPENAI_API_KEY env var if not provided)
-        model: Model name (default: gpt-4o)
+        api_key: API key (uses LLM_API_KEY or OPENAI_API_KEY env var if not provided)
+        base_url: Custom API endpoint URL (uses LLM_BASE_URL env var if not provided)
+        model: Model name (default: gpt-4o, uses LLM_MODEL env var if set)
         temperature: Temperature for generation (default: 0.0 for consistency)
+        config: LLMConfig instance (overrides individual parameters)
+        provider: Predefined provider name ("openai", "ollama", "groq", etc.)
         
     Returns:
         Configured ChatModel instance
-    """
-    # Use environment variable if no key provided
-    if api_key is None:
-        api_key = os.environ.get("OPENAI_API_KEY")
-    
-    if api_key is None:
-        raise ValueError(
-            "No API key provided. Set OPENAI_API_KEY environment variable "
-            "or pass api_key parameter."
+        
+    Examples:
+        # Using OpenAI (default)
+        llm = get_llm(api_key="sk-...")
+        
+        # Using Ollama locally
+        llm = get_llm(provider="ollama")
+        
+        # Using custom endpoint
+        llm = get_llm(
+            base_url="http://localhost:8000/v1",
+            model="llama3",
+            api_key="dummy"
         )
+        
+        # Using environment variables
+        # export LLM_BASE_URL="http://localhost:11434/v1"
+        # export LLM_MODEL="llama3"
+        # export LLM_API_KEY="ollama"
+        llm = get_llm()
+    """
+    # Use predefined provider if specified
+    if provider and provider in LLM_PROVIDERS:
+        config = LLM_PROVIDERS[provider]
     
-    return ChatOpenAI(
-        model=model,
-        temperature=temperature,
-        api_key=api_key,
-        max_tokens=2000,
-    )
+    # Create or merge configuration
+    if config is None:
+        config = LLMConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=temperature
+        )
+    else:
+        # Override config with explicit parameters
+        if api_key is not None:
+            config.api_key = api_key
+        if base_url is not None:
+            config.base_url = base_url
+        if model != "gpt-4o":  # Only override if not default
+            config.model = model
+        if temperature != 0.0:
+            config.temperature = temperature
+    
+    # Validate configuration
+    is_valid, error_msg = config.validate()
+    if not is_valid:
+        raise ValueError(error_msg)
+    
+    # Build ChatOpenAI with optional base_url
+    llm_kwargs = {
+        "model": config.model,
+        "temperature": config.temperature,
+        "api_key": config.api_key,
+        "max_tokens": config.max_tokens,
+    }
+    
+    # Only add base_url if specified (for custom endpoints)
+    if config.base_url:
+        llm_kwargs["base_url"] = config.base_url
+    
+    return ChatOpenAI(**llm_kwargs)
 
 
 def create_sql_generation_prompt() -> ChatPromptTemplate:
@@ -401,7 +555,10 @@ def run_query(
     user_question: str,
     llm: Optional[BaseChatModel] = None,
     api_key: Optional[str] = None,
-    model: str = "gpt-4o"
+    base_url: Optional[str] = None,
+    model: str = "gpt-4o",
+    config: Optional[LLMConfig] = None,
+    provider: Optional[str] = None
 ) -> QueryResult:
     """
     Main entry point for natural language to SQL query execution.
@@ -414,23 +571,50 @@ def run_query(
     
     Args:
         user_question: The natural language question from the user
-        llm: Optional pre-configured LLM instance
-        api_key: OpenAI API key (optional, uses env var if not provided)
-        model: Model name to use if creating new LLM instance
+        llm: Optional pre-configured LLM instance (bypasses other config)
+        api_key: API key (uses LLM_API_KEY or OPENAI_API_KEY env var if not provided)
+        base_url: Custom API endpoint URL (uses LLM_BASE_URL env var if not provided)
+        model: Model name (default: gpt-4o)
+        config: LLMConfig instance with all settings
+        provider: Predefined provider name ("openai", "ollama", "groq", "together", etc.)
         
     Returns:
         QueryResult containing the SQL, dataframe, and status
         
-    Example:
+    Examples:
+        # Using OpenAI with environment variable
+        >>> os.environ["OPENAI_API_KEY"] = "sk-..."
         >>> result = run_query("What were total sales by region last month?")
-        >>> if result.success:
-        ...     print(result.sql_query)
-        ...     print(result.dataframe.head())
+        
+        # Using Ollama locally
+        >>> result = run_query(
+        ...     "Show me top customers",
+        ...     provider="ollama"
+        ... )
+        
+        # Using custom endpoint
+        >>> result = run_query(
+        ...     "Total revenue by category",
+        ...     base_url="http://localhost:8000/v1",
+        ...     model="llama3",
+        ...     api_key="dummy"
+        ... )
+        
+        # Using pre-configured LLM
+        >>> from langchain_openai import ChatOpenAI
+        >>> llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="llama3")
+        >>> result = run_query("Show orders", llm=llm)
     """
     # Initialize LLM if not provided
     if llm is None:
         try:
-            llm = get_llm(api_key=api_key, model=model)
+            llm = get_llm(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                config=config,
+                provider=provider
+            )
         except ValueError as e:
             return QueryResult(
                 success=False,
@@ -660,17 +844,28 @@ def test_validation():
 
 
 def test_sql_generation():
-    """Test SQL generation (requires API key)."""
+    """Test SQL generation with configured LLM."""
     print("\n" + "=" * 80)
-    print("SQL GENERATION TEST (requires OPENAI_API_KEY)")
+    print("SQL GENERATION TEST")
     print("=" * 80)
     
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("\n⚠️  OPENAI_API_KEY not set. Skipping SQL generation tests.")
-        print("   Set the environment variable to run these tests:")
-        print("   export OPENAI_API_KEY='your-key-here'")
+    # Check for any API key configuration
+    config = LLMConfig.from_env()
+    
+    if not config.api_key:
+        print("\n⚠️  No LLM API key configured.")
+        print("\n   To use OpenAI:")
+        print("      export OPENAI_API_KEY='your-key-here'")
+        print("\n   To use a custom endpoint (Ollama, vLLM, etc.):")
+        print("      export LLM_API_KEY='your-key'")
+        print("      export LLM_BASE_URL='http://localhost:11434/v1'")
+        print("      export LLM_MODEL='llama3'")
+        print("\n   Or use a predefined provider:")
+        print("      result = run_query('question', provider='ollama')")
         return False
+    
+    print(f"\n✓ Using: {config.get_provider_info()}")
+    print(f"  Model: {config.model}")
     
     test_questions = [
         "Show me the top 5 customers by total order amount",
@@ -681,10 +876,35 @@ def test_sql_generation():
     
     for question in test_questions:
         print(f"\n--- Question: {question} ---")
-        result = run_query(question)
+        result = run_query(question, config=config)
         print(format_result_summary(result))
     
     return True
+
+
+def show_llm_config():
+    """Display current LLM configuration."""
+    print("\n" + "=" * 80)
+    print("LLM CONFIGURATION")
+    print("=" * 80)
+    
+    config = LLMConfig.from_env()
+    
+    print(f"\n  Provider: {config.get_provider_info()}")
+    print(f"  Model: {config.model}")
+    print(f"  Temperature: {config.temperature}")
+    print(f"  Max Tokens: {config.max_tokens}")
+    print(f"  API Key: {'✓ Set' if config.api_key else '✗ Not set'}")
+    print(f"  Base URL: {config.base_url or 'Default (OpenAI)'}")
+    
+    print("\n  Predefined Providers:")
+    for name, cfg in LLM_PROVIDERS.items():
+        print(f"    - {name}: {cfg.base_url or 'OpenAI default'}")
+    
+    print("\n  Environment Variables:")
+    print("    LLM_API_KEY / OPENAI_API_KEY - API key")
+    print("    LLM_BASE_URL - Custom endpoint URL")
+    print("    LLM_MODEL - Model name")
 
 
 # =============================================================================
@@ -697,6 +917,9 @@ if __name__ == "__main__":
     print("=" * 80)
     print("NL-BI Dashboard - SQL Chain Module Tests")
     print("=" * 80)
+    
+    # Show LLM configuration
+    show_llm_config()
     
     # Run validation tests
     all_passed = test_validation()
