@@ -53,6 +53,19 @@ from database_setup import (
     DB_PATH
 )
 
+# Security module imports
+from security import (
+    sanitize_user_input,
+    enforce_row_limit,
+    check_rate_limit,
+    record_query,
+    check_additional_sql_patterns,
+    generate_safe_error_message,
+    perform_security_check,
+    log_security_event,
+    MAX_ROWS_LIMIT
+)
+
 
 # =============================================================================
 # Configuration & Constants
@@ -513,6 +526,11 @@ def execute_sql_safely(sql: str) -> Tuple[bool, pd.DataFrame, str]:
     """
     Execute a validated SQL query safely with read-only connection.
     
+    Security measures:
+    1. Uses read-only database connection
+    2. Enforces row limit to prevent memory overload
+    3. Sanitizes error messages to prevent information leakage
+    
     Args:
         sql: The validated SQL query string
         
@@ -520,16 +538,30 @@ def execute_sql_safely(sql: str) -> Tuple[bool, pd.DataFrame, str]:
         Tuple of (success, dataframe, error_message)
     """
     try:
+        # Enforce row limit before execution
+        safe_sql = enforce_row_limit(sql, MAX_ROWS_LIMIT)
+        
+        # Get read-only connection
         conn = get_db_connection(read_only=True)
         
-        # Execute query
-        df = pd.read_sql_query(sql, conn)
+        # Execute query with row limit
+        df = pd.read_sql_query(safe_sql, conn)
         conn.close()
+        
+        # Double-check row count (belt and suspenders)
+        if len(df) > MAX_ROWS_LIMIT:
+            df = df.head(MAX_ROWS_LIMIT)
+            log_security_event(
+                "ROW_LIMIT_ENFORCED",
+                {"rows": len(df), "limit": MAX_ROWS_LIMIT}
+            )
         
         return True, df, ""
         
     except Exception as e:
-        return False, pd.DataFrame(), str(e)
+        # Generate safe error message
+        safe_error = generate_safe_error_message(e, include_details=False)
+        return False, pd.DataFrame(), safe_error
 
 
 # =============================================================================
@@ -558,16 +590,27 @@ def run_query(
     base_url: Optional[str] = None,
     model: str = "gpt-4o",
     config: Optional[LLMConfig] = None,
-    provider: Optional[str] = None
+    provider: Optional[str] = None,
+    user_id: str = "default"
 ) -> QueryResult:
     """
     Main entry point for natural language to SQL query execution.
     
-    This function orchestrates the full query pipeline:
-    1. Generate SQL from natural language using LLM
-    2. Validate the generated SQL for security
-    3. Execute the query safely
-    4. Retry with error feedback if needed (max 2 retries per PRD FR-10)
+    This function orchestrates the full query pipeline with security checks:
+    1. Sanitize and validate user input
+    2. Check rate limits
+    3. Generate SQL from natural language using LLM
+    4. Validate the generated SQL for security
+    5. Execute the query safely with row limits
+    6. Retry with error feedback if needed (max 2 retries per PRD FR-10)
+    
+    Security Features (per PRD Section 7):
+    - Input sanitization
+    - Rate limiting (30 queries per 5 minutes by default)
+    - SQL validation (multiple layers)
+    - Row limits (max 1000 rows)
+    - Read-only connection enforcement
+    - Safe error messages
     
     Args:
         user_question: The natural language question from the user
@@ -577,35 +620,47 @@ def run_query(
         model: Model name (default: gpt-4o)
         config: LLMConfig instance with all settings
         provider: Predefined provider name ("openai", "ollama", "groq", "together", etc.)
+        user_id: User/session identifier for rate limiting
         
     Returns:
         QueryResult containing the SQL, dataframe, and status
-        
-    Examples:
-        # Using OpenAI with environment variable
-        >>> os.environ["OPENAI_API_KEY"] = "sk-..."
-        >>> result = run_query("What were total sales by region last month?")
-        
-        # Using Ollama locally
-        >>> result = run_query(
-        ...     "Show me top customers",
-        ...     provider="ollama"
-        ... )
-        
-        # Using custom endpoint
-        >>> result = run_query(
-        ...     "Total revenue by category",
-        ...     base_url="http://localhost:8000/v1",
-        ...     model="llama3",
-        ...     api_key="dummy"
-        ... )
-        
-        # Using pre-configured LLM
-        >>> from langchain_openai import ChatOpenAI
-        >>> llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="llama3")
-        >>> result = run_query("Show orders", llm=llm)
     """
-    # Initialize LLM if not provided
+    # =========================================================================
+    # Security Check 1: Input Sanitization
+    # =========================================================================
+    sanitization = sanitize_user_input(user_question)
+    if not sanitization.is_safe:
+        log_security_event(
+            "INPUT_REJECTED",
+            {"reason": sanitization.blocked_reason},
+            user_id
+        )
+        return QueryResult(
+            success=False,
+            error_message=sanitization.blocked_reason
+        )
+    
+    # Use sanitized input
+    clean_question = sanitization.sanitized_input
+    
+    # =========================================================================
+    # Security Check 2: Rate Limiting
+    # =========================================================================
+    rate_check = check_rate_limit(user_id)
+    if not rate_check.is_allowed:
+        log_security_event(
+            "RATE_LIMITED",
+            {"remaining": rate_check.remaining_queries},
+            user_id
+        )
+        return QueryResult(
+            success=False,
+            error_message=rate_check.blocked_reason
+        )
+    
+    # =========================================================================
+    # Initialize LLM
+    # =========================================================================
     if llm is None:
         try:
             llm = get_llm(
