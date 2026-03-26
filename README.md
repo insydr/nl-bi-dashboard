@@ -20,6 +20,7 @@ The NL-BI Dashboard bridges the gap between business users and database insights
 - [API Reference](#api-reference)
 - [Testing](#testing)
 - [Future Roadmap](#future-roadmap)
+- [PostgreSQL Migration Guide](#postgresql-migration-guide)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
@@ -711,7 +712,7 @@ python database_setup.py
 
 ## Future Roadmap
 
-### Phase 1: MVP (Current) ✅
+### Phase 1: MVP ✅
 
 - [x] Database setup with sample e-commerce data
 - [x] 5-layer security validation
@@ -724,17 +725,24 @@ python database_setup.py
 - [x] Row limit enforcement
 - [x] Comprehensive test suite
 
-### Phase 2: Enhancements (Current) ✅
+### Phase 2: Enhancements (In Progress)
 
-- [x] **Few-shot prompting** for improved SQL accuracy
+Per PRD Section 10, Phase 2 deliverables:
+
+- [ ] **Switch to PostgreSQL** - Migrate from SQLite to PostgreSQL
+- [x] **Few-Shot Prompting** - Implement few-shot prompting for higher accuracy
+- [x] **"Explain this Chart"** - LLM analyzes the result data
+- [x] **Query History sidebar** - Persistent query history
+
+#### Additional Enhancements Implemented
+
+The following enhancements were implemented beyond the PRD requirements:
+
 - [x] **CTE (Common Table Expression) support** in SQL validation
-- [x] **Query history persistence** in SQLite
-- [x] **"Explain this chart"** natural language insights (AI-powered data analysis)
-- [x] **Query caching** with semantic cache (hash-based)
-- [ ] **Redis caching** for distributed deployments
-- [ ] **Custom schema support** for user databases
-- [ ] **Query templates** for common business questions
-- [ ] **Export to Excel** with formatting
+- [x] **Semantic caching** for query results (hash-based)
+- [x] **Streamlit caching decorators** for performance optimization
+- [x] **Hard LIMIT 5000** row protection
+- [x] **Performance benchmarking script**
 
 #### Few-Shot Prompting Feature
 
@@ -854,7 +862,28 @@ ENABLE_CACHING=true
 CACHE_TTL_SECONDS=3600
 ```
 
-### Phase 3: Production Migration
+### Phase 3: Production (Weeks 9+)
+
+Per PRD Section 10, Phase 3 deliverables:
+
+- [ ] **React Frontend** for better customization
+- [ ] **Caching layer (Redis)** for common queries
+- [ ] **Fine-tuning** a smaller model on successful query logs
+- [ ] **Role-Based Access Control (RBAC)** for data tables
+
+### Future Enhancements (Beyond PRD)
+
+The following items are potential future enhancements not defined in the PRD:
+
+- [ ] Custom schema support for user databases
+- [ ] Query templates for common business questions
+- [ ] Export to Excel with formatting
+- [ ] WebSocket support for real-time updates
+- [ ] Multi-tenant support
+
+---
+
+## PostgreSQL Migration Guide
 
 Per PRD Section 10, the following changes are needed to move from SQLite MVP to PostgreSQL Production:
 
