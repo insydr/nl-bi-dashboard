@@ -88,6 +88,7 @@ ALLOWED_TABLES = {
     "products": ["id", "name", "category", "price", "stock_quantity", "supplier"],
     "orders": ["id", "customer_id", "order_date", "total_amount", "status", "shipping_method"],
     "order_items": ["id", "order_id", "product_id", "quantity", "unit_price"],
+    "query_logs": ["id", "user_question", "generated_sql", "timestamp", "feedback", "row_count", "success"],
 }
 
 # SQL keywords blocklist (per PRD FR-09)
@@ -270,6 +271,24 @@ def define_schema() -> Dict[str, Table]:
         # Indexes
         Index("idx_order_items_order", "order_id"),
         Index("idx_order_items_product", "product_id"),
+    )
+
+    # Query Logs table (for history persistence)
+    tables["query_logs"] = Table(
+        "query_logs", metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("user_question", String(1000), nullable=False),
+        Column("generated_sql", String(5000), nullable=True),
+        Column("timestamp", String(50), nullable=False),
+        Column("feedback", String(20), nullable=True),  # 'positive', 'negative', or NULL
+        Column("row_count", Integer, nullable=True),
+        Column("success", Integer, nullable=False, default=1),  # 1 for success, 0 for failure
+        Column("error_message", String(500), nullable=True),
+        Column("execution_time_ms", Integer, nullable=True),
+
+        # Indexes
+        Index("idx_query_logs_timestamp", "timestamp"),
+        Index("idx_query_logs_success", "success"),
     )
 
     return tables
@@ -904,6 +923,224 @@ def test_connection() -> bool:
     except Exception as e:
         print(f"❌ Connection failed: {e}")
         return False
+
+
+# =============================================================================
+# Query Logging Functions (for history persistence)
+# =============================================================================
+
+def log_query_to_db(
+    user_question: str,
+    generated_sql: Optional[str],
+    success: bool,
+    row_count: Optional[int] = None,
+    error_message: Optional[str] = None,
+    execution_time_ms: Optional[int] = None
+) -> Optional[int]:
+    """
+    Log a query to the query_logs table for history persistence.
+
+    Args:
+        user_question: The natural language question from the user
+        generated_sql: The SQL query that was generated
+        success: Whether the query succeeded
+        row_count: Number of rows returned (if successful)
+        error_message: Error message (if failed)
+        execution_time_ms: Query execution time in milliseconds
+
+    Returns:
+        The ID of the inserted log entry, or None if logging failed
+    """
+    from datetime import datetime
+
+    try:
+        # Use read-write connection for logging
+        engine = get_db_engine(read_only=False, admin=True)
+
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    INSERT INTO query_logs 
+                    (user_question, generated_sql, timestamp, success, row_count, error_message, execution_time_ms)
+                    VALUES (:question, :sql, :timestamp, :success, :row_count, :error, :exec_time)
+                """),
+                {
+                    "question": user_question[:1000],  # Truncate to fit column
+                    "sql": generated_sql[:5000] if generated_sql else None,
+                    "timestamp": datetime.now().isoformat(),
+                    "success": 1 if success else 0,
+                    "row_count": row_count,
+                    "error": error_message[:500] if error_message else None,
+                    "exec_time": execution_time_ms
+                }
+            )
+            conn.commit()
+
+            # Get the inserted ID
+            last_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+
+            return last_id
+
+    except Exception as e:
+        # Don't fail the query if logging fails - just print a warning
+        print(f"⚠️ Failed to log query: {e}")
+        return None
+
+
+def get_recent_queries(limit: int = 10, success_only: bool = False) -> List[Dict[str, Any]]:
+    """
+    Get recent queries from the query_logs table.
+
+    Args:
+        limit: Maximum number of queries to return
+        success_only: If True, only return successful queries
+
+    Returns:
+        List of dictionaries with query log entries
+    """
+    try:
+        engine = get_db_engine(read_only=True)
+
+        with engine.connect() as conn:
+            if success_only:
+                result = conn.execute(
+                    text("""
+                        SELECT id, user_question, generated_sql, timestamp, feedback, row_count, success
+                        FROM query_logs
+                        WHERE success = 1
+                        ORDER BY timestamp DESC
+                        LIMIT :limit
+                    """),
+                    {"limit": limit}
+                )
+            else:
+                result = conn.execute(
+                    text("""
+                        SELECT id, user_question, generated_sql, timestamp, feedback, row_count, success
+                        FROM query_logs
+                        ORDER BY timestamp DESC
+                        LIMIT :limit
+                    """),
+                    {"limit": limit}
+                )
+
+            rows = result.fetchall()
+
+            return [
+                {
+                    "id": row[0],
+                    "user_question": row[1],
+                    "generated_sql": row[2],
+                    "timestamp": row[3],
+                    "feedback": row[4],
+                    "row_count": row[5],
+                    "success": bool(row[6])
+                }
+                for row in rows
+            ]
+
+    except Exception as e:
+        print(f"⚠️ Failed to get recent queries: {e}")
+        return []
+
+
+def update_query_feedback(log_id: int, feedback: str) -> bool:
+    """
+    Update the feedback for a query log entry.
+
+    Args:
+        log_id: The ID of the query log entry
+        feedback: The feedback value ('positive' or 'negative')
+
+    Returns:
+        True if update succeeded, False otherwise
+    """
+    try:
+        engine = get_db_engine(read_only=False, admin=True)
+
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    UPDATE query_logs
+                    SET feedback = :feedback
+                    WHERE id = :id
+                """),
+                {"feedback": feedback, "id": log_id}
+            )
+            conn.commit()
+
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Failed to update feedback: {e}")
+        return False
+
+
+def get_query_stats() -> Dict[str, Any]:
+    """
+    Get statistics about query history.
+
+    Returns:
+        Dictionary with query statistics
+    """
+    try:
+        engine = get_db_engine(read_only=True)
+
+        with engine.connect() as conn:
+            # Total queries
+            total = conn.execute(text("SELECT COUNT(*) FROM query_logs")).scalar()
+
+            # Successful queries
+            successful = conn.execute(
+                text("SELECT COUNT(*) FROM query_logs WHERE success = 1")
+            ).scalar()
+
+            # Positive feedback
+            positive = conn.execute(
+                text("SELECT COUNT(*) FROM query_logs WHERE feedback = 'positive'")
+            ).scalar()
+
+            # Negative feedback
+            negative = conn.execute(
+                text("SELECT COUNT(*) FROM query_logs WHERE feedback = 'negative'")
+            ).scalar()
+
+            return {
+                "total_queries": total,
+                "successful_queries": successful,
+                "success_rate": round(successful / total * 100, 1) if total > 0 else 0,
+                "positive_feedback": positive,
+                "negative_feedback": negative,
+                "feedback_rate": round((positive + negative) / total * 100, 1) if total > 0 else 0
+            }
+
+    except Exception as e:
+        print(f"⚠️ Failed to get query stats: {e}")
+        return {
+            "total_queries": 0,
+            "successful_queries": 0,
+            "success_rate": 0,
+            "positive_feedback": 0,
+            "negative_feedback": 0,
+            "feedback_rate": 0
+        }
+
+
+def ensure_query_logs_table() -> None:
+    """
+    Ensure the query_logs table exists (for upgrades from older versions).
+    """
+    try:
+        engine = get_db_engine(read_only=False, admin=True)
+        inspector = inspect(engine)
+
+        if "query_logs" not in inspector.get_table_names():
+            print("Creating query_logs table...")
+            metadata.create_all(engine, tables=[SCHEMA_TABLES["query_logs"]])
+            print("✓ query_logs table created")
+
+    except Exception as e:
+        print(f"⚠️ Failed to ensure query_logs table: {e}")
 
 
 # =============================================================================

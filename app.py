@@ -9,16 +9,17 @@ a chat-like interface for querying business data.
 Features:
 - Natural language query input
 - Suggested questions for quick exploration
-- Query history in sidebar
+- Query history in sidebar (persisted to database)
 - Interactive Plotly charts
 - SQL transparency view
 - Feedback mechanism (thumbs up/down)
 - Loading states for user feedback
+- Data insights generation ("Explain this Data")
 - Error handling with retry suggestions
 
 Layout (per PRD Section 8):
 - Sidebar: Query history, Suggested Questions
-- Main: Chat input, Chart display, Data table toggle, SQL view
+- Main: Chat input, Chart display, Data table toggle, SQL view, Insights
 """
 
 import streamlit as st
@@ -31,8 +32,15 @@ import os
 from pathlib import Path
 
 # Import our modules
-from sql_chain import run_query, QueryResult, LLMConfig, get_llm, show_llm_config
+from sql_chain import (
+    run_query, QueryResult, LLMConfig, get_llm, show_llm_config,
+    generate_data_insights
+)
 from visualization import generate_chart, get_chart_recommendation, ChartType
+from database_setup import (
+    get_recent_queries, update_query_feedback, ensure_query_logs_table,
+    get_query_stats
+)
 
 
 # =============================================================================
@@ -123,6 +131,27 @@ st.markdown("""
         font-size: 1rem;
         color: #64748b;
     }
+    
+    /* Insights box */
+    .insights-box {
+        background-color: #f0f9ff;
+        border-left: 4px solid #3b82f6;
+        padding: 1rem;
+        border-radius: 8px;
+        margin-top: 1rem;
+    }
+    
+    /* History item */
+    .history-item {
+        padding: 0.5rem;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: background-color 0.2s;
+    }
+    
+    .history-item:hover {
+        background-color: #f1f5f9;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -142,16 +171,34 @@ def init_session_state():
     if "current_result" not in st.session_state:
         st.session_state.current_result = None
     
+    if "current_question" not in st.session_state:
+        st.session_state.current_question = ""
+    
     if "show_sql" not in st.session_state:
         st.session_state.show_sql = False
     
     if "show_table" not in st.session_state:
         st.session_state.show_table = False
     
+    if "show_insights" not in st.session_state:
+        st.session_state.show_insights = False
+    
+    if "insights_text" not in st.session_state:
+        st.session_state.insights_text = ""
+    
+    if "insights_loading" not in st.session_state:
+        st.session_state.insights_loading = False
+    
     if "llm_configured" not in st.session_state:
         # Check if LLM is configured
         config = LLMConfig.from_env()
         st.session_state.llm_configured = config.api_key is not None
+    
+    # Ensure query_logs table exists
+    try:
+        ensure_query_logs_table()
+    except Exception:
+        pass  # Ignore errors during initialization
 
 
 # =============================================================================
@@ -181,36 +228,52 @@ def format_datetime(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S") if dt else ""
 
 
-def save_query_to_history(question: str, result: QueryResult):
-    """Save query to session history."""
+def format_timestamp(iso_timestamp: str) -> str:
+    """Format ISO timestamp for display."""
+    try:
+        dt = datetime.fromisoformat(iso_timestamp)
+        return dt.strftime("%m/%d %H:%M")
+    except Exception:
+        return iso_timestamp[:16] if len(iso_timestamp) > 16 else iso_timestamp
+
+
+def save_query_to_session(question: str, result: QueryResult):
+    """Save query to session history (in addition to database logging)."""
     history_entry = {
         "timestamp": datetime.now().isoformat(),
         "question": question,
         "success": result.success,
         "sql": result.sql_query,
         "row_count": len(result.dataframe) if result.dataframe is not None else 0,
-        "error": result.error_message if not result.success else None
+        "error": result.error_message if not result.success else None,
+        "log_id": result.log_id
     }
     
     # Add to beginning of list (most recent first)
     st.session_state.query_history.insert(0, history_entry)
     
-    # Keep only last 20 queries
+    # Keep only last 20 queries in session
     if len(st.session_state.query_history) > 20:
         st.session_state.query_history = st.session_state.query_history[:20]
 
 
-def save_feedback(question: str, sql: str, is_positive: bool, comment: str = ""):
+def save_feedback(question: str, sql: str, is_positive: bool, log_id: Optional[int] = None, comment: str = ""):
     """Save user feedback."""
     feedback_entry = {
         "timestamp": datetime.now().isoformat(),
         "question": question,
         "sql": sql,
         "is_positive": is_positive,
-        "comment": comment
+        "comment": comment,
+        "log_id": log_id
     }
     
     st.session_state.feedback_log.append(feedback_entry)
+    
+    # Update feedback in database if log_id is available
+    if log_id:
+        feedback_value = "positive" if is_positive else "negative"
+        update_query_feedback(log_id, feedback_value)
 
 
 def get_status_emoji(success: bool) -> str:
@@ -233,7 +296,7 @@ def render_sql_view(sql: Optional[str]):
         )
 
 
-def render_feedback_buttons(question: str, sql: Optional[str]):
+def render_feedback_buttons(question: str, sql: Optional[str], log_id: Optional[int] = None):
     """Render thumbs up/down feedback buttons."""
     if not sql:
         return
@@ -245,13 +308,13 @@ def render_feedback_buttons(question: str, sql: Optional[str]):
     
     with col1:
         if st.button("👍 Helpful", key="feedback_positive", use_container_width=True):
-            save_feedback(question, sql, is_positive=True)
+            save_feedback(question, sql, is_positive=True, log_id=log_id)
             st.success("Thanks for your feedback! 🎉")
             st.rerun()
     
     with col2:
         if st.button("👎 Not Helpful", key="feedback_negative", use_container_width=True):
-            save_feedback(question, sql, is_positive=False)
+            save_feedback(question, sql, is_positive=False, log_id=log_id)
             st.warning("Thanks for the feedback. We'll use it to improve! 📝")
             st.rerun()
 
@@ -275,31 +338,88 @@ def render_suggested_questions():
             st.rerun()
 
 
-def render_query_history():
-    """Render query history in sidebar."""
+def render_persisted_history():
+    """Render query history from database in sidebar."""
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📜 Recent Queries")
     
-    if not st.session_state.query_history:
-        st.sidebar.caption("No queries yet. Try asking a question!")
-        return
-    
-    for i, entry in enumerate(st.session_state.query_history[:10]):
-        status = get_status_emoji(entry["success"])
-        timestamp = format_datetime(datetime.fromisoformat(entry["timestamp"]))
+    try:
+        # Get recent queries from database
+        db_history = get_recent_queries(limit=10, success_only=True)
         
-        with st.sidebar.expander(f"{status} {entry['question'][:30]}...", expanded=False):
-            st.caption(f"⏰ {timestamp}")
-            st.caption(f"📊 {entry['row_count']} rows returned")
+        if not db_history:
+            st.sidebar.caption("No queries yet. Try asking a question!")
+            return
+        
+        for entry in db_history:
+            status = get_status_emoji(entry["success"])
+            timestamp = format_timestamp(entry["timestamp"])
+            question = entry["user_question"]
             
-            if entry["success"] and entry["sql"]:
-                st.code(entry["sql"], language="sql")
-            elif entry["error"]:
-                st.error(f"Error: {entry['error']}")
+            # Create a clickable expander
+            with st.sidebar.expander(f"{status} {question[:25]}...", expanded=False):
+                st.caption(f"⏰ {timestamp}")
+                st.caption(f"📊 {entry['row_count']} rows")
+                
+                if entry["generated_sql"]:
+                    st.code(entry["generated_sql"][:200] + "..." if len(entry["generated_sql"]) > 200 else entry["generated_sql"], language="sql")
+                
+                # Button to re-run this query
+                if st.button("🔄 Re-run", key=f"rerun_db_{entry['id']}"):
+                    st.session_state.suggested_question = question
+                    st.rerun()
+                    
+    except Exception as e:
+        st.sidebar.caption("Unable to load history")
+        # Fallback to session history
+        if st.session_state.query_history:
+            for i, entry in enumerate(st.session_state.query_history[:5]):
+                status = get_status_emoji(entry["success"])
+                st.sidebar.caption(f"{status} {entry['question'][:30]}...")
+
+
+def render_insights_section(df: pd.DataFrame, question: str):
+    """Render the data insights section."""
+    st.markdown("---")
+    
+    col1, col2 = st.columns([1, 5])
+    
+    with col1:
+        if st.button("💡 Get Insights", key="get_insights_btn", use_container_width=True):
+            st.session_state.show_insights = True
+            st.session_state.insights_loading = True
+            st.session_state.insights_text = ""
+            st.rerun()
+    
+    with col2:
+        st.markdown("**Let AI analyze this data and explain key trends**")
+    
+    # Show insights if requested
+    if st.session_state.show_insights:
+        if st.session_state.insights_loading:
+            with st.spinner("🤔 Analyzing data..."):
+                try:
+                    insights = generate_data_insights(df, question)
+                    st.session_state.insights_text = insights
+                    st.session_state.insights_loading = False
+                except Exception as e:
+                    st.session_state.insights_text = f"Error generating insights: {str(e)}"
+                    st.session_state.insights_loading = False
+                st.rerun()
+        
+        # Display insights
+        if st.session_state.insights_text:
+            st.markdown("#### 📊 Data Insights")
+            st.markdown(f"""
+            <div class="insights-box">
+            {st.session_state.insights_text}
+            </div>
+            """, unsafe_allow_html=True)
             
-            # Button to re-run this query
-            if st.button("🔄 Re-run", key=f"rerun_{i}"):
-                st.session_state.suggested_question = entry["question"]
+            # Button to hide insights
+            if st.button("Hide Insights", key="hide_insights_btn"):
+                st.session_state.show_insights = False
+                st.session_state.insights_text = ""
                 st.rerun()
 
 
@@ -316,7 +436,10 @@ def render_result(result: QueryResult, question: str):
         return
     
     # Success - display results
-    st.success(f"✅ Query executed successfully! ({len(result.dataframe)} rows)")
+    success_msg = f"✅ Query executed successfully! ({len(result.dataframe)} rows)"
+    if result.execution_time_ms:
+        success_msg += f" in {result.execution_time_ms}ms"
+    st.success(success_msg)
     
     # Generate and display chart
     try:
@@ -346,8 +469,12 @@ def render_result(result: QueryResult, question: str):
     # SQL transparency view
     render_sql_view(result.sql_query)
     
+    # Insights section
+    if len(result.dataframe) > 0:
+        render_insights_section(result.dataframe, question)
+    
     # Feedback buttons
-    render_feedback_buttons(question, result.sql_query)
+    render_feedback_buttons(question, result.sql_query, result.log_id)
 
 
 def render_welcome_screen():
@@ -443,6 +570,15 @@ def render_settings_panel():
     st.sidebar.caption(f"**Provider:** {provider_info}")
     st.sidebar.caption(f"**Model:** {config.model}")
     
+    # Show query stats
+    try:
+        stats = get_query_stats()
+        if stats["total_queries"] > 0:
+            st.sidebar.markdown("**Session Stats:**")
+            st.sidebar.caption(f"Queries: {stats['total_queries']} | Success: {stats['success_rate']}%")
+    except Exception:
+        pass
+    
     # Chart preference
     chart_preference = st.sidebar.selectbox(
         "Default Chart Style",
@@ -484,7 +620,7 @@ def main():
         st.caption("Natural Language → SQL → Insights")
         
         render_suggested_questions()
-        render_query_history()
+        render_persisted_history()
         render_settings_panel()
     
     # Handle suggested question click
@@ -492,21 +628,26 @@ def main():
         question = st.session_state.suggested_question
         del st.session_state.suggested_question
         
+        # Reset insights state
+        st.session_state.show_insights = False
+        st.session_state.insights_text = ""
+        
         # Process the query
         if llm_ready:
             with st.spinner("🤔 Thinking..."):
                 result = run_query(question)
             
             st.session_state.current_result = result
-            save_query_to_history(question, result)
+            st.session_state.current_question = question
+            save_query_to_session(question, result)
         else:
             st.session_state.current_result = None
+            st.rerun()
     
     # Main content area
     if st.session_state.current_result:
         # Show previous result
-        last_question = st.session_state.query_history[0]["question"] if st.session_state.query_history else ""
-        render_result(st.session_state.current_result, last_question)
+        render_result(st.session_state.current_result, st.session_state.current_question)
     else:
         # Show welcome screen
         render_welcome_screen()
@@ -517,6 +658,10 @@ def main():
     if llm_ready:
         # Use st.chat_input for a chat-like experience
         if prompt := st.chat_input("Ask a question about your data..."):
+            # Reset insights state for new query
+            st.session_state.show_insights = False
+            st.session_state.insights_text = ""
+            
             # Show user message
             with st.chat_message("user"):
                 st.markdown(prompt)
@@ -536,7 +681,8 @@ def main():
                     
                     # Save and display result
                     st.session_state.current_result = result
-                    save_query_to_history(prompt, result)
+                    st.session_state.current_question = prompt
+                    save_query_to_session(prompt, result)
                     
                     # Render result
                     render_result(result, prompt)

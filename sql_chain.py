@@ -53,7 +53,11 @@ from database_setup import (
     BLOCKED_KEYWORDS,
     DB_TYPE,
     DatabaseType,
-    get_connection_string
+    get_connection_string,
+    log_query_to_db,
+    get_recent_queries,
+    update_query_feedback,
+    ensure_query_logs_table
 )
 
 # Few-shot examples for improved SQL generation
@@ -771,6 +775,8 @@ class QueryResult:
     error_message: Optional[str] = None
     retry_count: int = 0
     validation_details: Optional[SQLValidationResult] = None
+    log_id: Optional[int] = None  # ID of the query log entry
+    execution_time_ms: Optional[int] = None  # Query execution time in milliseconds
 
 
 # =============================================================================
@@ -819,6 +825,9 @@ def run_query(
     Returns:
         QueryResult containing the SQL, dataframe, and status
     """
+    import time
+    start_time = time.time()
+    
     # =========================================================================
     # Security Check 1: Input Sanitization
     # =========================================================================
@@ -964,12 +973,26 @@ Remember:
             success, df, error = execute_sql_safely(validation_result.cleaned_sql)
             
             if success:
+                # Calculate execution time
+                execution_time_ms = int((time.time() - start_time) * 1000)
+                
+                # Log successful query to database
+                log_id = log_query_to_db(
+                    user_question=user_question,
+                    generated_sql=validation_result.cleaned_sql,
+                    success=True,
+                    row_count=len(df),
+                    execution_time_ms=execution_time_ms
+                )
+                
                 return QueryResult(
                     success=True,
                     sql_query=validation_result.cleaned_sql,
                     dataframe=df,
                     retry_count=retry_count,
-                    validation_details=validation_result
+                    validation_details=validation_result,
+                    log_id=log_id,
+                    execution_time_ms=execution_time_ms
                 )
             else:
                 # Execution failed - prepare for retry
@@ -977,12 +1000,26 @@ Remember:
                 retry_count += 1
                 
                 if retry_count > MAX_RETRIES:
+                    # Calculate execution time
+                    execution_time_ms = int((time.time() - start_time) * 1000)
+                    
+                    # Log failed query
+                    log_id = log_query_to_db(
+                        user_question=user_question,
+                        generated_sql=sql_query,
+                        success=False,
+                        error_message=error,
+                        execution_time_ms=execution_time_ms
+                    )
+                    
                     return QueryResult(
                         success=False,
                         sql_query=sql_query,
                         error_message=f"Query execution failed after {MAX_RETRIES} retries. Last error: {error}",
                         retry_count=retry_count,
-                        validation_details=validation_result
+                        validation_details=validation_result,
+                        log_id=log_id,
+                        execution_time_ms=execution_time_ms
                     )
                 
         except Exception as e:
@@ -990,17 +1027,42 @@ Remember:
             last_error = str(e)
             
             if retry_count > MAX_RETRIES:
+                # Calculate execution time
+                execution_time_ms = int((time.time() - start_time) * 1000)
+                
+                # Log failed query
+                log_id = log_query_to_db(
+                    user_question=user_question,
+                    generated_sql=last_sql if last_sql else None,
+                    success=False,
+                    error_message=str(e),
+                    execution_time_ms=execution_time_ms
+                )
+                
                 return QueryResult(
                     success=False,
                     error_message=f"Unexpected error after {MAX_RETRIES} retries: {str(e)}",
-                    retry_count=retry_count
+                    retry_count=retry_count,
+                    log_id=log_id,
+                    execution_time_ms=execution_time_ms
                 )
     
     # Should not reach here, but return failure if we do
+    execution_time_ms = int((time.time() - start_time) * 1000)
+    log_id = log_query_to_db(
+        user_question=user_question,
+        generated_sql=last_sql if last_sql else None,
+        success=False,
+        error_message="Maximum retries exceeded",
+        execution_time_ms=execution_time_ms
+    )
+    
     return QueryResult(
         success=False,
         error_message="Maximum retries exceeded",
-        retry_count=retry_count
+        retry_count=retry_count,
+        log_id=log_id,
+        execution_time_ms=execution_time_ms
     )
 
 
@@ -1036,6 +1098,120 @@ Error: {result.error_message}
 SQL attempted: {result.sql_query}
 Retries: {result.retry_count}
 """
+
+
+# =============================================================================
+# Data Insights Function
+# =============================================================================
+
+def generate_data_insights(
+    df: pd.DataFrame,
+    question: str,
+    llm: Optional[BaseChatModel] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: str = "gpt-4o",
+    config: Optional[LLMConfig] = None
+) -> str:
+    """
+    Generate natural language insights from a DataFrame using the LLM.
+    
+    This function analyzes the data and provides key trends, patterns,
+    and anomalies in an easy-to-understand format.
+    
+    Args:
+        df: The DataFrame to analyze
+        question: The original user question (for context)
+        llm: Optional pre-configured LLM instance
+        api_key: API key override
+        base_url: Custom endpoint URL
+        model: Model name (default: gpt-4o)
+        config: LLMConfig instance
+        
+    Returns:
+        String containing the insights in bullet point format
+    """
+    if df is None or df.empty:
+        return "No data available to analyze."
+    
+    # Initialize LLM if not provided
+    if llm is None:
+        try:
+            llm = get_llm(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                config=config
+            )
+        except ValueError as e:
+            return f"Unable to generate insights: {str(e)}"
+    
+    # Prepare data summary for the LLM
+    try:
+        # Get head of data
+        head_str = df.head(10).to_string()
+        
+        # Get describe for numeric columns
+        describe_str = ""
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        if numeric_cols:
+            describe_str = df[numeric_cols].describe().to_string()
+        
+        # Get info about columns
+        col_info = []
+        for col in df.columns:
+            dtype = str(df[col].dtype)
+            unique = df[col].nunique()
+            nulls = df[col].isnull().sum()
+            col_info.append(f"  - {col}: {dtype}, {unique} unique values, {nulls} nulls")
+        
+        col_info_str = "\n".join(col_info)
+        
+        # Create the prompt
+        insights_prompt = f"""Act as a data analyst. Analyze the following data and provide key insights.
+
+**Original Question:** {question}
+
+**Data Summary:**
+- Total rows: {len(df)}
+- Total columns: {len(df.columns)}
+- Columns:
+{col_info_str}
+
+**First 10 rows:**
+```
+{head_str}
+```
+
+**Statistical Summary:**
+```
+{describe_str}
+```
+
+Based on this data, provide exactly 3 key insights in bullet point format. Focus on:
+1. The most significant trend or pattern
+2. Any notable outliers or anomalies
+3. Actionable business recommendations
+
+Format your response as:
+• [Insight 1]
+• [Insight 2]
+• [Insight 3]
+"""
+        
+        # Create prompt template and invoke LLM
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert data analyst who provides clear, actionable insights from data. Be concise and specific."),
+            ("human", "{prompt_text}")
+        ])
+        
+        chain = prompt | llm | StrOutputParser()
+        insights = chain.invoke({"prompt_text": insights_prompt})
+        
+        return insights
+        
+    except Exception as e:
+        return f"Error generating insights: {str(e)}"
 
 
 # =============================================================================
