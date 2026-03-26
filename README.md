@@ -725,14 +725,70 @@ python database_setup.py
 - [x] Row limit enforcement
 - [x] Comprehensive test suite
 
-### Phase 2: Enhancements (In Progress)
+### Phase 2: Enhancements ✅
 
 Per PRD Section 10, Phase 2 deliverables:
 
-- [ ] **Switch to PostgreSQL** - Migrate from SQLite to PostgreSQL
+- [x] **Switch to PostgreSQL** - Full PostgreSQL support with Docker Compose setup
 - [x] **Few-Shot Prompting** - Implement few-shot prompting for higher accuracy
 - [x] **"Explain this Chart"** - LLM analyzes the result data
 - [x] **Query History sidebar** - Persistent query history
+
+#### PostgreSQL Setup
+
+The system supports both SQLite (MVP) and PostgreSQL (Production). To switch to PostgreSQL:
+
+**1. Start PostgreSQL with Docker:**
+
+```bash
+# Start PostgreSQL container
+docker-compose up -d postgres
+
+# Verify container is running
+docker-compose ps
+```
+
+**2. Initialize the database:**
+
+```bash
+# Set environment variables for PostgreSQL
+export DB_TYPE=postgresql
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_NAME=nlbi_dashboard
+export DB_ADMIN_USER=admin
+export DB_ADMIN_PASSWORD=admin_secret_2024
+
+# Initialize database with sample data
+python database_setup.py
+```
+
+**3. Configure the application:**
+
+```bash
+# Update .env file
+echo "DB_TYPE=postgresql" >> .env
+echo "DB_HOST=localhost" >> .env
+echo "DB_USER=nlbi_readonly" >> .env
+echo "DB_PASSWORD=nlbi_readonly_secret_2024" >> .env
+
+# Run the dashboard
+streamlit run app.py
+```
+
+**Docker Services:**
+
+| Service | Port | Purpose |
+|---------|------|--------|
+| PostgreSQL | 5432 | Database server |
+| pgAdmin 4 | 5050 | Web-based DB management (optional) |
+
+**Start pgAdmin (optional):**
+
+```bash
+docker-compose --profile admin up -d
+# Access pgAdmin at http://localhost:5050
+```
 
 #### Additional Enhancements Implemented
 
