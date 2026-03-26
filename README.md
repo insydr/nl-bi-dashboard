@@ -9,7 +9,7 @@ The NL-BI Dashboard translates natural language questions into secure SQL querie
 ## 🏗️ Architecture
 
 ```
-User Question → LangChain SQL Chain → Security Validation → Database Query → Results
+User Question → LangChain SQL Chain → Security Validation → Database Query → Auto Visualization
 ```
 
 ### Security Layers (Defense in Depth)
@@ -24,8 +24,10 @@ User Question → LangChain SQL Chain → Security Validation → Database Query
 
 ```
 nlbi-dashboard/
-├── database_setup.py    # Database initialization and connection management
+├── app.py               # Streamlit frontend UI
 ├── sql_chain.py         # LangChain SQL chain and security validation
+├── visualization.py     # Automatic chart generation engine
+├── database_setup.py    # Database initialization and connection management
 ├── data/
 │   └── ecommerce.db     # SQLite database with sample e-commerce data
 ├── requirements.txt     # Python dependencies
@@ -44,12 +46,16 @@ nlbi-dashboard/
 
 ## 🚀 Quick Start
 
-### 1. Set Up Environment
+### 1. Clone and Setup
 
 ```bash
+# Clone the repository
+git clone https://github.com/insydr/nl-bi-dashboard.git
+cd nl-bi-dashboard
+
 # Create virtual environment
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
@@ -65,22 +71,16 @@ python database_setup.py
 
 ```bash
 cp .env.example .env
-# Edit .env and configure your LLM provider
+# Edit .env with your preferred LLM configuration
 ```
 
-### 4. Test SQL Chain
+### 4. Run the Dashboard
 
 ```bash
-# Run validation tests
-python sql_chain.py
-
-# Test in Python
-python -c "
-from sql_chain import run_query, format_result_summary
-result = run_query('Show me the top 5 customers by total order amount')
-print(format_result_summary(result))
-"
+streamlit run app.py
 ```
+
+The dashboard will open at **http://localhost:8501**
 
 ## 🤖 LLM Configuration
 
@@ -135,13 +135,6 @@ config = LLMConfig(
 
 # Use with run_query
 result = run_query("Total revenue by category", config=config)
-
-# Or create LLM directly
-llm = get_llm(
-    base_url="https://api.groq.com/openai/v1",
-    model="llama-3.1-70b-versatile",
-    api_key="gsk_xxxx"
-)
 ```
 
 ### Example: Using Ollama Locally
@@ -158,14 +151,33 @@ export LLM_API_KEY="ollama"
 export LLM_BASE_URL="http://localhost:11434/v1"
 export LLM_MODEL="llama3"
 
-# 4. Run queries
-python -c "
-from sql_chain import run_query
-result = run_query('What is the total revenue?')
-print(result.sql_query)
-print(result.dataframe)
-"
+# 4. Run the dashboard
+streamlit run app.py
 ```
+
+## 📊 Features
+
+### Natural Language Query Interface
+- Type questions in plain English
+- Context retention for follow-up questions
+- Suggested questions for quick exploration
+
+### Automatic Visualization
+- **KPI Cards** - Single aggregate values
+- **Line Charts** - Time series data
+- **Bar Charts** - Category comparisons
+- **Pie Charts** - Distribution breakdowns
+- **Scatter Plots** - Correlation analysis
+- **Tables** - Fallback for complex data
+
+### Transparency & Control
+- View generated SQL query
+- Download results as CSV
+- Query history in sidebar
+
+### Feedback System
+- Thumbs up/down feedback
+- Helps improve model accuracy
 
 ## 🔒 Security Features
 
@@ -192,33 +204,30 @@ conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
 
 Execute a natural language query against the database.
 
-**Parameters:**
-- `user_question` (str): Natural language question
-- `llm` (BaseChatModel, optional): Pre-configured LLM instance
-- `api_key` (str, optional): API key for the LLM provider
-- `base_url` (str, optional): Custom API endpoint URL
-- `model` (str): Model name (default: "gpt-4o")
-- `config` (LLMConfig, optional): Complete configuration object
-- `provider` (str, optional): Predefined provider name
+```python
+from sql_chain import run_query
 
-**Returns:** `QueryResult` dataclass with:
-- `success` (bool): Whether query succeeded
-- `sql_query` (str): Generated SQL query
-- `dataframe` (pd.DataFrame): Query results
-- `error_message` (str): Error if failed
-- `retry_count` (int): Number of retries used
+result = run_query("What were total sales by region last month?")
 
-### `get_llm(**options)`
+if result.success:
+    print(result.sql_query)
+    print(result.dataframe.head())
+```
 
-Create an LLM instance with flexible configuration.
+### `generate_chart(df, query)`
 
-### `validate_sql(query)`
+Generate an appropriate chart from a DataFrame.
 
-Validate SQL query for security compliance.
+```python
+from visualization import generate_chart
+
+fig = generate_chart(df, "Sales by region")
+fig.show()  # Or use st.plotly_chart(fig) in Streamlit
+```
 
 ### `LLMConfig`
 
-Configuration dataclass for LLM settings.
+Configuration for LLM settings.
 
 ```python
 from sql_chain import LLMConfig
@@ -226,43 +235,72 @@ from sql_chain import LLMConfig
 config = LLMConfig(
     api_key="your-key",
     base_url="http://localhost:11434/v1",
-    model="llama3",
-    temperature=0.0,
-    max_tokens=2000
+    model="llama3"
 )
 ```
 
 ## 🧪 Testing
 
 ```bash
-# Run all tests
+# Run validation tests
 python sql_chain.py
+
+# Run visualization tests
+python visualization.py --save
 
 # Run with specific provider
 LLM_API_KEY=ollama LLM_BASE_URL=http://localhost:11434/v1 LLM_MODEL=llama3 python sql_chain.py
 ```
 
+## 📸 Screenshots
+
+### Main Dashboard
+![Dashboard](https://via.placeholder.com/800x400/3b82f6/white?text=NL-BI+Dashboard)
+
+### Query Example
+![Query](https://via.placeholder.com/800x400/10b981/white?text=Query+Results)
+
 ## 📈 Roadmap
 
-### Phase 1: MVP (Current)
+### Phase 1: MVP (Current) ✅
 - [x] Database setup with sample data
 - [x] Security validation layer
 - [x] LangChain SQL chain
 - [x] OpenAI-compatible endpoint support
-- [ ] Streamlit UI
-- [ ] Plotly visualization
+- [x] Streamlit UI
+- [x] Plotly visualization
 
 ### Phase 2: Enhancement
 - [ ] PostgreSQL migration
 - [ ] Few-shot prompting
-- [ ] Query history
+- [ ] Query history persistence
 - [ ] "Explain this chart" feature
+- [ ] Query caching
 
 ### Phase 3: Production
 - [ ] React frontend
 - [ ] Redis caching
 - [ ] Model fine-tuning
 - [ ] RBAC implementation
+- [ ] Multi-tenant support
+
+## 🐛 Troubleshooting
+
+### "LLM Not Configured" Error
+Make sure you have set either `OPENAI_API_KEY` or `LLM_API_KEY` environment variable.
+
+### "Database not found" Error
+Run `python database_setup.py` to create the database.
+
+### "Query Failed" with SQL Error
+- Check the generated SQL in the "View Generated SQL" section
+- Try rephrasing your question
+- Use suggested questions as examples
+
+### Slow Response Time
+- For local LLMs, ensure your model is loaded
+- Consider using a smaller model (e.g., `llama3:8b` instead of `llama3:70b`)
+- For cloud providers, check your API rate limits
 
 ## 📄 License
 
@@ -271,3 +309,10 @@ MIT License
 ## 👤 Author
 
 Sydr Dev (rsd.iz.rosyid@gmail.com)
+
+## 🙏 Acknowledgments
+
+- [LangChain](https://langchain.com) - SQL chain framework
+- [Streamlit](https://streamlit.io) - UI framework
+- [Plotly](https://plotly.com) - Visualization library
+- [sqlparse](https://github.com/andialbrecht/sqlparse) - SQL parsing and validation
