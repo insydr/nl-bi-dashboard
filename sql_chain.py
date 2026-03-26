@@ -30,6 +30,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from io import StringIO
 
+# SQLAlchemy
+from sqlalchemy import text
+
 # LangChain imports
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder, FewShotPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -58,7 +61,9 @@ from database_setup import (
     log_query_to_db,
     get_recent_queries,
     update_query_feedback,
-    ensure_query_logs_table
+    ensure_query_logs_table,
+    get_table_ref,
+    PG_SCHEMA
 )
 
 # Few-shot examples for improved SQL generation
@@ -1040,8 +1045,15 @@ def execute_sql_safely(sql: str) -> Tuple[bool, pd.DataFrame, str]:
         # Get read-only SQLAlchemy engine
         engine = get_db_engine(read_only=True)
         
-        # Execute query with row limit
-        df = pd.read_sql_query(safe_sql, engine)
+        # For PostgreSQL with custom schema, set search_path
+        if DB_TYPE == DatabaseType.POSTGRESQL and PG_SCHEMA != "public":
+            with engine.connect() as conn:
+                # Set search_path to include custom schema
+                conn.execute(text(f"SET search_path TO {PG_SCHEMA}, public"))
+                df = pd.read_sql_query(safe_sql, conn)
+        else:
+            # Execute query with row limit
+            df = pd.read_sql_query(safe_sql, engine)
         
         # Double-check row count (belt and suspenders)
         if len(df) > MAX_ROWS_LIMIT:

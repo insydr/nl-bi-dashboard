@@ -77,6 +77,7 @@ PG_PORT = int(os.environ.get("DB_PORT", "5432"))
 PG_NAME = os.environ.get("DB_NAME", "nlbi_dashboard")
 PG_USER = os.environ.get("DB_USER", "nlbi_readonly")
 PG_PASSWORD = os.environ.get("DB_PASSWORD", "nlbi_readonly_secret_2024")
+PG_SCHEMA = os.environ.get("DB_SCHEMA", "public")  # Custom schema support
 
 # Admin credentials for schema creation
 PG_ADMIN_USER = os.environ.get("DB_ADMIN_USER", "admin")
@@ -143,7 +144,10 @@ def get_connection_string(
     elif db == DatabaseType.POSTGRESQL:
         user = PG_ADMIN_USER if admin else PG_USER
         password = PG_ADMIN_PASSWORD if admin else PG_PASSWORD
-        return f"postgresql://{user}:{password}@{PG_HOST}:{PG_PORT}/{PG_NAME}"
+        sslmode = os.environ.get("DB_SSL_MODE", "prefer")
+        # Include schema in connection options
+        conn_str = f"postgresql://{user}:{password}@{PG_HOST}:{PG_PORT}/{PG_NAME}?sslmode={sslmode}"
+        return conn_str
 
     else:
         raise ValueError(f"Unsupported database type: {db}")
@@ -699,6 +703,21 @@ def get_db_cursor(read_only: bool = True):
 # Schema Introspection (for LLM context)
 # =============================================================================
 
+def get_table_ref(table_name: str) -> str:
+    """
+    Get fully qualified table reference with schema prefix for PostgreSQL.
+    
+    Args:
+        table_name: The table name without schema
+        
+    Returns:
+        Table reference with schema prefix for PostgreSQL, or just table_name for SQLite
+    """
+    if DB_TYPE == DatabaseType.POSTGRESQL:
+        return f"{PG_SCHEMA}.{table_name}"
+    return table_name
+
+
 def get_schema_info() -> Dict[str, Any]:
     """
     Get database schema information for LLM context.
@@ -714,10 +733,13 @@ def get_schema_info() -> Dict[str, Any]:
 
     schema_info = {}
 
+    # Use the configured schema for PostgreSQL
+    inspect_schema = PG_SCHEMA if DB_TYPE == DatabaseType.POSTGRESQL else None
+
     with engine.connect() as conn:
         for table_name in ALLOWED_TABLES.keys():
             # Get column info
-            columns = inspector.get_columns(table_name)
+            columns = inspector.get_columns(table_name, schema=inspect_schema)
 
             schema_info[table_name] = {
                 "columns": [
@@ -738,8 +760,9 @@ def get_schema_info() -> Dict[str, Any]:
                 if col_name in ["region", "category", "status", "customer_segment",
                                "shipping_method", "supplier"]:
                     try:
+                        table_ref = get_table_ref(table_name)
                         result = conn.execute(
-                            text(f"SELECT DISTINCT {col_name} FROM {table_name} LIMIT 10")
+                            text(f"SELECT DISTINCT {col_name} FROM {table_ref} LIMIT 10")
                         )
                         values = [row[0] for row in result.fetchall()]
                         schema_info[table_name]["sample_values"][col_name] = values
@@ -846,7 +869,8 @@ def init_database(db_type: Optional[DatabaseType] = None, force: bool = False) -
         # Verify data
         with engine.connect() as conn:
             for table in ALLOWED_TABLES.keys():
-                result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
+                table_ref = get_table_ref(table)
+                result = conn.execute(text(f"SELECT COUNT(*) FROM {table_ref}"))
                 count = result.scalar()
                 print(f"  {table}: {count} rows")
 
@@ -898,8 +922,9 @@ def test_connection() -> bool:
         engine = get_db_engine(read_only=True)
         inspector = inspect(engine)
 
-        # Check for expected tables
-        existing_tables = set(inspector.get_table_names())
+        # Check for expected tables (use schema for PostgreSQL)
+        inspect_schema = PG_SCHEMA if DB_TYPE == DatabaseType.POSTGRESQL else None
+        existing_tables = set(inspector.get_table_names(schema=inspect_schema))
         expected_tables = set(ALLOWED_TABLES.keys())
 
         missing_tables = expected_tables - existing_tables
@@ -914,7 +939,8 @@ def test_connection() -> bool:
 
         # Test a simple query
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT COUNT(*) FROM customers"))
+            table_ref = get_table_ref("customers")
+            result = conn.execute(text(f"SELECT COUNT(*) FROM {table_ref}"))
             count = result.scalar()
             print(f"   Customers count: {count}")
 
