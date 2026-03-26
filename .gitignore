@@ -63,3 +63,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Generated test charts
+test_charts/
