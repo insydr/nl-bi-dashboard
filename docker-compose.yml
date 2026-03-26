@@ -1,0 +1,107 @@
+# NL-BI Dashboard - PostgreSQL Development Environment
+# ====================================================
+# Docker Compose configuration for local PostgreSQL development
+#
+# Usage:
+#   docker-compose up -d          # Start containers in background
+#   docker-compose down           # Stop and remove containers
+#   docker-compose down -v        # Stop and remove containers + volumes
+#   docker-compose logs -f postgres  # View PostgreSQL logs
+#
+# Services:
+#   - postgres: PostgreSQL 16 database server
+#   - pgadmin: pgAdmin 4 web interface (optional)
+
+version: '3.8'
+
+services:
+  # ===========================================================================
+  # PostgreSQL Database Server
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: nlbi-postgres
+    restart: unless-stopped
+    environment:
+      # Superuser credentials (for administrative tasks)
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-admin_secret_2024}
+      POSTGRES_DB: ${POSTGRES_DB:-nlbi_dashboard}
+
+      # Performance tuning
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C.UTF-8"
+
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      # Persist database data
+      - postgres_data:/var/lib/postgresql/data
+
+      # Initialize scripts (runs on first start)
+      - ./docker/init-db:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-admin} -d ${POSTGRES_DB:-nlbi_dashboard}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    networks:
+      - nlbi-network
+
+    # Security: Limit resources
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # ===========================================================================
+  # pgAdmin 4 - Web-based PostgreSQL Administration Tool (Optional)
+  # ===========================================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: nlbi-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@nlbi.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-pgadmin_secret_2024}
+      PGADMIN_LISTEN_PORT: 5050
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+
+    ports:
+      - "${PGADMIN_PORT:-5050}:5050"
+
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - nlbi-network
+
+    profiles:
+      - admin  # Only start with --profile admin
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  nlbi-network:
+    driver: bridge
+    name: nlbi-network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    name: nlbi-postgres-data
+  pgadmin_data:
+    name: nlbi-pgadmin-data

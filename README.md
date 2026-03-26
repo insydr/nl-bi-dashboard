@@ -20,6 +20,7 @@ The NL-BI Dashboard bridges the gap between business users and database insights
 - [API Reference](#api-reference)
 - [Testing](#testing)
 - [Future Roadmap](#future-roadmap)
+- [PostgreSQL Migration Guide](#postgresql-migration-guide)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
@@ -52,6 +53,10 @@ The NL-BI Dashboard translates natural language questions into secure SQL querie
 - **Intelligent Visualization**: Automatic chart type selection based on data analysis
 - **Transparent SQL**: View the generated SQL for verification and learning
 - **Feedback System**: Thumbs up/down to help improve accuracy
+- **Few-Shot Prompting**: Dynamic example selection for complex SQL patterns (CTEs, window functions)
+- **Query History**: Persistent history with sidebar access to recent queries
+- **AI-Powered Insights**: One-click data analysis with natural language explanations
+- **Semantic Caching**: Intelligent query caching for faster responses and reduced API costs
 
 ---
 
@@ -65,6 +70,8 @@ The NL-BI Dashboard translates natural language questions into secure SQL querie
 | **Visualization** | Plotly Express | Auto-chart generation (Bar, Line, Pie, KPI, Scatter) |
 | **Security** | sqlparse + regex | SQL validation and injection prevention |
 | **Validation** | Pydantic | Data models and configuration |
+| **Caching** | Semantic Cache | Hash-based query result caching |
+| **Embeddings** | sentence-transformers | Semantic similarity for few-shot selection |
 
 ### Dependencies
 
@@ -79,6 +86,7 @@ sqlparse>=0.5.0
 sqlalchemy>=2.0.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
+sentence-transformers>=2.2.0
 ```
 
 ---
@@ -429,10 +437,12 @@ Even if all other security layers fail, the database connection is strictly read
 
 ### Row Limit Protection
 
-All queries are automatically limited to 1000 rows maximum to prevent:
+All queries are automatically limited to **5000 rows maximum** to prevent:
 - Memory overload attacks
 - Full table dumps
 - Performance degradation
+
+The system automatically injects `LIMIT 5000` to all SELECT queries, overriding any user-specified limit that exceeds this threshold.
 
 ### Rate Limiting
 
@@ -555,6 +565,60 @@ config = LLMConfig(
 is_valid, error = config.validate()
 ```
 
+#### `generate_data_insights(df, question)`
+
+Generate AI-powered natural language insights from query results.
+
+```python
+from sql_chain import generate_data_insights
+
+# Generate insights from a DataFrame
+df = result.dataframe  # From a query result
+insights = generate_data_insights(df, "What were total sales by region?")
+
+print(insights)
+# Output:
+# 📊 Data Insights:
+# 1. Top Region: West leads with $38,245 in revenue (27.9% of total)
+# 2. Growth Trend: Revenue increased 15% compared to the previous period
+# ...
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `df` | pd.DataFrame | The query result data |
+| `question` | str | The original user question for context |
+
+**Returns:** `str` - Natural language insights about the data
+
+#### `SemanticCache`
+
+Manage the query result cache.
+
+```python
+from sql_chain import SemanticCache
+
+# Initialize cache
+cache = SemanticCache()
+
+# Check cache
+key = cache.get_cache_key("What is total revenue?")
+cached = cache.get(key)
+
+if cached:
+    print("Cache hit!")
+    result = cached
+else:
+    # Run query and store result
+    result = run_query("What is total revenue?")
+    cache.set(key, result)
+
+# Clear cache
+cache.clear()
+```
+
 ### Security Functions
 
 ```python
@@ -648,7 +712,7 @@ python database_setup.py
 
 ## Future Roadmap
 
-### Phase 1: MVP (Current) ✅
+### Phase 1: MVP ✅
 
 - [x] Database setup with sample e-commerce data
 - [x] 5-layer security validation
@@ -661,17 +725,221 @@ python database_setup.py
 - [x] Row limit enforcement
 - [x] Comprehensive test suite
 
-### Phase 2: Enhancements (Next)
+### Phase 2: Enhancements ✅
 
-- [ ] **Few-shot prompting** for improved SQL accuracy
-- [ ] **Query history persistence** in SQLite
-- [ ] **"Explain this chart"** natural language insights
-- [ ] **Query caching** with Redis
-- [ ] **Custom schema support** for user databases
-- [ ] **Query templates** for common business questions
-- [ ] **Export to Excel** with formatting
+Per PRD Section 10, Phase 2 deliverables:
 
-### Phase 3: Production Migration
+- [x] **Switch to PostgreSQL** - Full PostgreSQL support with Docker Compose setup
+- [x] **Few-Shot Prompting** - Implement few-shot prompting for higher accuracy
+- [x] **"Explain this Chart"** - LLM analyzes the result data
+- [x] **Query History sidebar** - Persistent query history
+
+#### PostgreSQL Setup
+
+The system supports both SQLite (MVP) and PostgreSQL (Production). To switch to PostgreSQL:
+
+**1. Start PostgreSQL with Docker:**
+
+```bash
+# Start PostgreSQL container
+docker-compose up -d postgres
+
+# Verify container is running
+docker-compose ps
+```
+
+**2. Initialize the database:**
+
+```bash
+# Set environment variables for PostgreSQL
+export DB_TYPE=postgresql
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_NAME=nlbi_dashboard
+export DB_ADMIN_USER=admin
+export DB_ADMIN_PASSWORD=admin_secret_2024
+
+# Initialize database with sample data
+python database_setup.py
+```
+
+**3. Configure the application:**
+
+```bash
+# Update .env file
+echo "DB_TYPE=postgresql" >> .env
+echo "DB_HOST=localhost" >> .env
+echo "DB_USER=nlbi_readonly" >> .env
+echo "DB_PASSWORD=nlbi_readonly_secret_2024" >> .env
+
+# Run the dashboard
+streamlit run app.py
+```
+
+**Docker Services:**
+
+| Service | Port | Purpose |
+|---------|------|--------|
+| PostgreSQL | 5432 | Database server |
+| pgAdmin 4 | 5050 | Web-based DB management (optional) |
+
+**Start pgAdmin (optional):**
+
+```bash
+docker-compose --profile admin up -d
+# Access pgAdmin at http://localhost:5050
+```
+
+#### Additional Enhancements Implemented
+
+The following enhancements were implemented beyond the PRD requirements:
+
+- [x] **CTE (Common Table Expression) support** in SQL validation
+- [x] **Semantic caching** for query results (hash-based)
+- [x] **Streamlit caching decorators** for performance optimization
+- [x] **Hard LIMIT 5000** row protection
+- [x] **Performance benchmarking script**
+
+#### Few-Shot Prompting Feature
+
+The NL-BI Dashboard now uses **few-shot prompting** to guide the LLM in generating correct SQL for complex queries. This significantly improves accuracy for queries involving:
+
+- **Window functions** (LAG, LEAD, ROW_NUMBER)
+- **Common Table Expressions (CTEs)**
+- **Complex JOINs** with aggregations
+- **Month-over-month comparisons**
+- **Customer retention analysis**
+
+**How it works:**
+
+1. The system maintains a curated repository of 10 example queries covering various SQL patterns
+2. For each user question, the most relevant 2-3 examples are dynamically selected based on semantic similarity
+3. These examples are included in the LLM prompt to guide SQL generation
+4. Result: More accurate SQL, fewer retries, better handling of complex queries
+
+**Configuration:**
+
+```bash
+# Enable/disable dynamic example selection (default: true)
+ENABLE_DYNAMIC_EXAMPLES=true
+
+# Number of examples per prompt (default: 3)
+NUM_FEW_SHOT_EXAMPLES=3
+
+# Minimum similarity threshold for selection (default: 0.3)
+MIN_EXAMPLE_SIMILARITY=0.3
+```
+
+**Example queries now handled correctly:**
+
+| Complex Query | Technique Used |
+|---------------|----------------|
+| "Show month-over-month revenue growth" | LAG() window function with CTE |
+| "Customer retention by signup month" | LEFT JOIN + CASE WHEN + CTE |
+| "Products with low stock and high sales" | HAVING clause + COALESCE |
+| "Average order value by segment" | Multiple aggregations + ROUND |
+
+#### Query History & Insights
+
+**Query History Persistence:**
+
+- All queries are automatically logged to the `query_logs` table in SQLite
+- Sidebar displays the last 10 queries for quick re-execution
+- Each entry shows the question, timestamp, and success status
+- Click on any history item to re-run the query
+
+**AI-Powered Data Insights:**
+
+- Click the "💡 Insights" button after any query to get AI-generated analysis
+- The system analyzes your data and provides natural language explanations
+- Insights include trends, anomalies, top performers, and recommendations
+- Great for users who want deeper understanding of their data
+
+**Example Insight Output:**
+
+```
+📊 Data Insights:
+
+1. Top Region: West leads with $38,245 in revenue (27.9% of total)
+2. Growth Trend: Revenue increased 15% compared to the previous period
+3. Anomaly Detected: North region shows unusually low average order value
+4. Recommendation: Consider investigating the North region's pricing strategy
+```
+
+#### Performance Optimization & Caching
+
+**Semantic Caching:**
+
+The system implements intelligent query caching to reduce API costs and improve response times:
+
+- **Hash-based caching**: Questions are normalized and hashed for cache lookup
+- **Cache hit**: Previously asked questions return cached results instantly (< 100ms)
+- **Cache miss**: New questions go through the full LLM pipeline
+- **Cache key normalization**: Handles case, whitespace, and punctuation variations
+
+**Streamlit Caching:**
+
+Two types of caching decorators optimize the UI:
+
+| Decorator | Used For | Benefit |
+|-----------|----------|--------|
+| `@st.cache_resource` | LLM chain initialization | Singleton pattern, avoids re-creation |
+| `@st.cache_data` | Database connections, schema retrieval | Memoization with TTL support |
+
+**Row Limiting:**
+
+- Hard limit of **5000 rows** on all queries
+- Automatic `LIMIT 5000` injection if no limit specified
+- User-specified limits above 5000 are capped
+- Protects against memory issues and performance degradation
+
+**Performance Benchmarks:**
+
+| Scenario | Response Time | API Calls |
+|----------|---------------|----------|
+| First query (cold cache) | 2-5 seconds | 1 LLM call |
+| Repeated query (cache hit) | < 100ms | 0 LLM calls |
+| Similar query (few-shot) | 2-4 seconds | 1 LLM call |
+| Data insights generation | 3-6 seconds | 1 LLM call |
+
+Run the benchmark script:
+
+```bash
+python benchmark_caching.py
+```
+
+**Caching Configuration:**
+
+```bash
+# Enable/disable caching (default: true)
+ENABLE_CACHING=true
+
+# Cache TTL in seconds (default: 3600 = 1 hour)
+CACHE_TTL_SECONDS=3600
+```
+
+### Phase 3: Production (Weeks 9+)
+
+Per PRD Section 10, Phase 3 deliverables:
+
+- [ ] **React Frontend** for better customization
+- [ ] **Caching layer (Redis)** for common queries
+- [ ] **Fine-tuning** a smaller model on successful query logs
+- [ ] **Role-Based Access Control (RBAC)** for data tables
+
+### Future Enhancements (Beyond PRD)
+
+The following items are potential future enhancements not defined in the PRD:
+
+- [ ] Custom schema support for user databases
+- [ ] Query templates for common business questions
+- [ ] Export to Excel with formatting
+- [ ] WebSocket support for real-time updates
+- [ ] Multi-tenant support
+
+---
+
+## PostgreSQL Migration Guide
 
 Per PRD Section 10, the following changes are needed to move from SQLite MVP to PostgreSQL Production:
 
@@ -898,18 +1166,23 @@ customers (1) ──────< (N) orders (1) ──────< (N) order_i
 
 ```
 nlbi-dashboard/
-├── app.py               # Streamlit frontend UI
-├── sql_chain.py         # LangChain SQL chain and security validation
-├── visualization.py     # Automatic chart generation engine
-├── database_setup.py    # Database initialization and connection management
-├── security.py          # Security hardening module
-├── test_queries.py      # Pytest test suite
+├── app.py                  # Streamlit frontend UI with caching decorators
+├── sql_chain.py            # LangChain SQL chain with few-shot prompting & caching
+├── query_examples.py       # Few-shot example repository (10 examples)
+├── visualization.py        # Automatic chart generation engine
+├── database_setup.py       # Database initialization, connection & query logging
+├── security.py             # Security hardening module
+├── test_queries.py         # Pytest test suite for security/validation
+├── test_few_shot.py        # Few-shot prompting test suite
+├── benchmark_caching.py    # Performance benchmark for cached vs uncached queries
 ├── data/
-│   └── ecommerce.db     # SQLite database with sample e-commerce data
-├── requirements.txt     # Python dependencies with versions
-├── .env.example         # Environment configuration template
-├── .gitignore           # Git ignore patterns
-└── README.md            # This file
+│   └── ecommerce.db        # SQLite database with sample e-commerce data
+├── screenshots/            # Production screenshots for documentation
+├── docker/                 # Docker configuration for PostgreSQL
+├── requirements.txt        # Python dependencies with versions
+├── .env.example            # Environment configuration template
+├── .gitignore              # Git ignore patterns
+└── README.md               # This file
 ```
 
 ---

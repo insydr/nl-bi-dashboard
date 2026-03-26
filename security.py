@@ -36,7 +36,8 @@ import os
 # =============================================================================
 
 # Maximum rows returned per query (prevent memory overload)
-MAX_ROWS_LIMIT = 1000
+# Updated to 5000 per Step 10 requirements
+MAX_ROWS_LIMIT = 5000
 
 # Maximum character length for user questions
 MAX_QUESTION_LENGTH = 500
@@ -661,9 +662,9 @@ def test_row_limit():
     print("=" * 60)
     
     test_cases = [
-        ("SELECT * FROM customers", "SELECT * FROM customers LIMIT 1000", "No limit"),
+        ("SELECT * FROM customers", f"SELECT * FROM customers LIMIT {MAX_ROWS_LIMIT}", "No limit"),
         ("SELECT * FROM customers LIMIT 10", "SELECT * FROM customers LIMIT 10", "Existing small limit"),
-        ("SELECT * FROM customers LIMIT 5000", f"SELECT * FROM customers LIMIT {MAX_ROWS_LIMIT}", "Excessive limit"),
+        ("SELECT * FROM customers LIMIT 10000", f"SELECT * FROM customers LIMIT {MAX_ROWS_LIMIT}", "Excessive limit"),
         ("SELECT * FROM customers LIMIT 100 OFFSET 50", "SELECT * FROM customers LIMIT 100 OFFSET 50", "Limit with offset"),
     ]
     

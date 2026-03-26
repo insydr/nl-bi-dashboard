@@ -11,13 +11,14 @@ Features:
 - Dynamic schema loading for LLM context
 - Self-correction retry mechanism (max 2 retries)
 - Read-only enforcement at multiple levels
+- Multi-database support (SQLite, PostgreSQL)
 
 Security Architecture (Defense in Depth):
 1. SQL Parser Validation (sqlparse) - Validates SQL structure
 2. Keyword Blocklist (regex) - Blocks destructive commands
 3. Statement Type Check - Only SELECT statements allowed
 4. Schema Allow-List - Only permitted tables/columns
-5. Read-Only DB Connection - SQLite URI mode enforces read-only
+5. Read-Only DB Connection - SQLite URI mode or PostgreSQL read-only user
 """
 
 import re
@@ -27,9 +28,13 @@ import os
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass, field
 from enum import Enum
+from io import StringIO
+
+# SQLAlchemy
+from sqlalchemy import text
 
 # LangChain imports
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder, FewShotPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableSequence
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
@@ -46,11 +51,27 @@ from pydantic import BaseModel, Field
 
 # Local imports
 from database_setup import (
-    get_db_connection,
+    get_db_engine,
     get_schema_for_prompt,
     ALLOWED_TABLES,
     BLOCKED_KEYWORDS,
-    DB_PATH
+    DB_TYPE,
+    DatabaseType,
+    get_connection_string,
+    log_query_to_db,
+    get_recent_queries,
+    update_query_feedback,
+    ensure_query_logs_table,
+    get_table_ref,
+    PG_SCHEMA
+)
+
+# Few-shot examples for improved SQL generation
+from query_examples import (
+    get_few_shot_examples,
+    get_examples_for_langchain,
+    get_relevant_examples,
+    SQLExample
 )
 
 # Security module imports
@@ -76,6 +97,302 @@ MAX_RETRIES = 2
 
 # SQL statement types that are allowed
 ALLOWED_STATEMENT_TYPES = {"SELECT"}
+
+# =============================================================================
+# Semantic Cache Configuration
+# =============================================================================
+
+# Enable/disable caching (set via environment variable)
+ENABLE_CACHE = os.environ.get("ENABLE_CACHE", "true").lower() == "true"
+
+# Cache TTL in seconds (default: 1 hour)
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
+
+# Maximum cache entries
+MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "100"))
+
+# Minimum similarity threshold for semantic cache hits (0.0 to 1.0)
+# Lower values = more matches but potentially less relevant
+SEMANTIC_SIMILARITY_THRESHOLD = float(os.environ.get("SEMANTIC_SIMILARITY_THRESHOLD", "0.85"))
+
+
+# =============================================================================
+# Semantic Cache Implementation
+# =============================================================================
+
+@dataclass
+class CacheEntry:
+    """A cached query result."""
+    question: str
+    question_hash: str
+    sql: str
+    result_df_json: str  # Serialized DataFrame
+    success: bool
+    timestamp: float
+    hit_count: int = 0
+    column_names: List[str] = field(default_factory=list)
+
+
+class SemanticCache:
+    """
+    Semantic cache for SQL query results.
+    
+    Features:
+    - Exact match caching using question hash
+    - Optional semantic similarity matching (when sentence-transformers available)
+    - TTL-based expiration
+    - LRU eviction when max entries reached
+    - Cache statistics tracking
+    
+    Cache Flow:
+    1. Before calling LLM, check cache for similar questions
+    2. If found and not expired, return cached result
+    3. Otherwise, call LLM and cache the result
+    """
+    
+    def __init__(
+        self,
+        max_entries: int = MAX_CACHE_ENTRIES,
+        ttl_seconds: int = CACHE_TTL_SECONDS,
+        similarity_threshold: float = SEMANTIC_SIMILARITY_THRESHOLD
+    ):
+        self.max_entries = max_entries
+        self.ttl_seconds = ttl_seconds
+        self.similarity_threshold = similarity_threshold
+        self._cache: Dict[str, CacheEntry] = {}
+        self._access_order: List[str] = []  # For LRU eviction
+        self._embedding_model = None
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "total_queries": 0
+        }
+    
+    def _compute_hash(self, question: str) -> str:
+        """Compute a hash for the question."""
+        import hashlib
+        normalized = question.lower().strip()
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    
+    def _compute_embedding(self, text: str) -> Optional[List[float]]:
+        """
+        Compute embedding for semantic similarity.
+        
+        Returns None if sentence-transformers is not available.
+        """
+        if self._embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            except ImportError:
+                return None
+        
+        try:
+            embedding = self._embedding_model.encode(text)
+            return embedding.tolist()
+        except Exception:
+            return None
+    
+    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
+        """Compute cosine similarity between two vectors."""
+        import math
+        if len(vec1) != len(vec2):
+            return 0.0
+        
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = math.sqrt(sum(a * a for a in vec1))
+        norm2 = math.sqrt(sum(b * b for b in vec2))
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+    
+    def _is_expired(self, entry: CacheEntry) -> bool:
+        """Check if a cache entry has expired."""
+        import time
+        return (time.time() - entry.timestamp) > self.ttl_seconds
+    
+    def _evict_lru(self) -> None:
+        """Evict the least recently used entry."""
+        if not self._access_order:
+            return
+        
+        oldest_key = self._access_order.pop(0)
+        if oldest_key in self._cache:
+            del self._cache[oldest_key]
+            self._stats["evictions"] += 1
+    
+    def _update_access_order(self, key: str) -> None:
+        """Update the access order for LRU tracking."""
+        if key in self._access_order:
+            self._access_order.remove(key)
+        self._access_order.append(key)
+    
+    def get(self, question: str) -> Optional[Tuple[pd.DataFrame, str, bool]]:
+        """
+        Get cached result for a question.
+        
+        Args:
+            question: User's natural language question
+            
+        Returns:
+            Tuple of (DataFrame, SQL, success) if cache hit, None otherwise
+        """
+        if not ENABLE_CACHE:
+            return None
+        
+        self._stats["total_queries"] += 1
+        question_hash = self._compute_hash(question)
+        
+        # Check exact match first
+        if question_hash in self._cache:
+            entry = self._cache[question_hash]
+            
+            if not self._is_expired(entry):
+                # Cache hit!
+                entry.hit_count += 1
+                self._update_access_order(question_hash)
+                self._stats["hits"] += 1
+                
+                # Deserialize DataFrame
+                df = pd.read_json(StringIO(entry.result_df_json))
+                return df, entry.sql, entry.success
+            else:
+                # Expired, remove it
+                del self._cache[question_hash]
+                if question_hash in self._access_order:
+                    self._access_order.remove(question_hash)
+        
+        # Try semantic similarity (if available)
+        question_embedding = self._compute_embedding(question)
+        if question_embedding is not None:
+            best_match_key = None
+            best_similarity = 0.0
+            
+            for key, entry in self._cache.items():
+                if self._is_expired(entry):
+                    continue
+                
+                entry_embedding = self._compute_embedding(entry.question)
+                if entry_embedding:
+                    similarity = self._cosine_similarity(question_embedding, entry_embedding)
+                    if similarity > best_similarity and similarity >= self.similarity_threshold:
+                        best_similarity = similarity
+                        best_match_key = key
+            
+            if best_match_key:
+                entry = self._cache[best_match_key]
+                entry.hit_count += 1
+                self._update_access_order(best_match_key)
+                self._stats["hits"] += 1
+                
+                df = pd.read_json(StringIO(entry.result_df_json))
+                return df, entry.sql, entry.success
+        
+        # Cache miss
+        self._stats["misses"] += 1
+        return None
+    
+    def set(
+        self,
+        question: str,
+        sql: str,
+        df: pd.DataFrame,
+        success: bool
+    ) -> None:
+        """
+        Store a result in the cache.
+        
+        Args:
+            question: User's natural language question
+            sql: Generated SQL query
+            df: Result DataFrame
+            success: Whether the query succeeded
+        """
+        if not ENABLE_CACHE:
+            return
+        
+        import time
+        question_hash = self._compute_hash(question)
+        
+        # Check if we need to evict
+        while len(self._cache) >= self.max_entries:
+            self._evict_lru()
+        
+        # Serialize DataFrame
+        result_df_json = df.to_json(orient='records') if df is not None and not df.empty else "[]"
+        
+        # Create cache entry
+        entry = CacheEntry(
+            question=question,
+            question_hash=question_hash,
+            sql=sql,
+            result_df_json=result_df_json,
+            success=success,
+            timestamp=time.time(),
+            hit_count=0,
+            column_names=list(df.columns) if df is not None and not df.empty else []
+        )
+        
+        self._cache[question_hash] = entry
+        self._update_access_order(question_hash)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total = self._stats["hits"] + self._stats["misses"]
+        hit_rate = (self._stats["hits"] / total * 100) if total > 0 else 0
+        
+        return {
+            "hits": self._stats["hits"],
+            "misses": self._stats["misses"],
+            "evictions": self._stats["evictions"],
+            "total_queries": self._stats["total_queries"],
+            "hit_rate_percent": round(hit_rate, 2),
+            "cache_size": len(self._cache),
+            "max_entries": self.max_entries
+        }
+    
+    def clear(self) -> None:
+        """Clear the cache."""
+        self._cache.clear()
+        self._access_order.clear()
+    
+    def cleanup_expired(self) -> int:
+        """Remove all expired entries. Returns count of removed entries."""
+        import time
+        expired_keys = []
+        
+        for key, entry in self._cache.items():
+            if self._is_expired(entry):
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self._cache[key]
+            if key in self._access_order:
+                self._access_order.remove(key)
+        
+        return len(expired_keys)
+
+
+# Global cache instance
+_cache = SemanticCache()
+
+
+def get_cache() -> SemanticCache:
+    """Get the global cache instance."""
+    return _cache
+
+
+def clear_cache() -> None:
+    """Clear the global cache."""
+    _cache.clear()
+
+
+def get_cache_stats() -> Dict[str, Any]:
+    """Get cache statistics."""
+    return _cache.get_stats()
 
 
 # =============================================================================
@@ -172,6 +489,153 @@ LLM_PROVIDERS = {
         model="auto"
     ),
 }
+
+
+# =============================================================================
+# Few-Shot Example Selection Configuration
+# =============================================================================
+
+# Enable/disable dynamic example selection based on semantic similarity
+ENABLE_DYNAMIC_EXAMPLES = os.environ.get("ENABLE_DYNAMIC_EXAMPLES", "true").lower() == "true"
+
+# Number of examples to include in prompt (3-5 recommended to avoid token limits)
+NUM_FEW_SHOT_EXAMPLES = int(os.environ.get("NUM_FEW_SHOT_EXAMPLES", "3"))
+
+# Minimum similarity threshold for dynamic example selection
+MIN_EXAMPLE_SIMILARITY = float(os.environ.get("MIN_EXAMPLE_SIMILARITY", "0.3"))
+
+
+# =============================================================================
+# Database-Specific SQL Prompts
+# =============================================================================
+
+SQL_SYSTEM_PROMPT_SQLITE = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid SQLite queries.
+
+{schema_info}
+
+{few_shot_examples}
+
+CRITICAL SECURITY RULES:
+1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
+2. Use ONLY the tables and columns shown in the schema above.
+3. For date comparisons, use SQLite date format (YYYY-MM-DD).
+4. Return ONLY the SQL query without any explanation, markdown formatting, or code blocks.
+5. Do not use subqueries that attempt to access system tables.
+6. Use proper JOIN syntax when combining data from multiple tables.
+7. Use meaningful column aliases for calculated fields.
+8. For aggregations, always include appropriate GROUP BY clauses.
+
+DATABASE-SPECIFIC NOTES (SQLite):
+- This is SQLite, not PostgreSQL or MySQL
+- Date functions: Use date(), strftime(), datetime() for date operations
+- String functions: Use || for concatenation, LIKE for pattern matching
+- Boolean values: SQLite uses 0 and 1 for false/true
+- Use LIMIT for row restrictions
+- For month-over-month comparisons, use window functions like LAG() with CTEs
+
+When the user asks a question, generate a single, valid SQLite SELECT query that answers it.
+Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
+
+SQL_SYSTEM_PROMPT_POSTGRESQL = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid PostgreSQL queries.
+
+{schema_info}
+
+{few_shot_examples}
+
+CRITICAL SECURITY RULES:
+1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
+2. Use ONLY the tables and columns shown in the schema above.
+3. For date comparisons, use PostgreSQL date format (YYYY-MM-DD).
+4. Return ONLY the SQL query without any explanation, markdown formatting, or code blocks.
+5. Do not use subqueries that attempt to access system tables.
+6. Use proper JOIN syntax when combining data from multiple tables.
+7. Use meaningful column aliases for calculated fields.
+8. For aggregations, always include appropriate GROUP BY clauses.
+
+DATABASE-SPECIFIC NOTES (PostgreSQL):
+- This is PostgreSQL, not SQLite or MySQL
+- Date functions: Use DATE_TRUNC(), TO_CHAR(), EXTRACT(), NOW() for date operations
+- String functions: Use || for concatenation, ILIKE for case-insensitive pattern matching
+- Boolean values: Use TRUE/FALSE keywords
+- Use LIMIT for row restrictions
+- Use DOUBLE PRECISION for floating point calculations
+- Quote identifiers with double quotes if needed (e.g., "order")
+- For month-over-month comparisons, use window functions like LAG() with CTEs
+
+When the user asks a question, generate a single, valid PostgreSQL SELECT query that answers it.
+Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
+
+
+def get_sql_system_prompt() -> str:
+    """Get the appropriate SQL system prompt based on database type."""
+    if DB_TYPE == DatabaseType.POSTGRESQL:
+        return SQL_SYSTEM_PROMPT_POSTGRESQL
+    return SQL_SYSTEM_PROMPT_SQLITE
+
+
+def format_few_shot_examples(examples: List[SQLExample]) -> str:
+    """
+    Format few-shot examples for inclusion in the system prompt.
+
+    Args:
+        examples: List of SQLExample objects to format
+
+    Returns:
+        Formatted string with examples for the prompt
+    """
+    if not examples:
+        return ""
+
+    formatted = "HERE ARE SOME EXAMPLE QUERIES TO GUIDE YOU:\n\n"
+
+    for i, ex in enumerate(examples, 1):
+        formatted += f"Example {i}:\n"
+        formatted += f"Question: {ex.question}\n"
+        formatted += f"SQL: {ex.sql}\n\n"
+
+    return formatted
+
+
+def select_examples_for_question(question: str) -> List[SQLExample]:
+    """
+    Select the most relevant examples for a given question.
+
+    Uses dynamic selection if enabled, otherwise returns a curated set.
+
+    Args:
+        question: User's natural language question
+
+    Returns:
+        List of relevant SQLExample objects
+    """
+    if ENABLE_DYNAMIC_EXAMPLES:
+        # Use semantic similarity or keyword matching
+        return get_relevant_examples(
+            question,
+            top_k=NUM_FEW_SHOT_EXAMPLES,
+            min_similarity=MIN_EXAMPLE_SIMILARITY
+        )
+    else:
+        # Return a curated mix of examples
+        all_examples = get_few_shot_examples()
+        # Prioritize examples of varying complexity
+        simple = [ex for ex in all_examples if ex.complexity == "simple"]
+        medium = [ex for ex in all_examples if ex.complexity == "medium"]
+        complex_ex = [ex for ex in all_examples if ex.complexity == "complex"]
+
+        selected = []
+        if simple:
+            selected.append(simple[0])
+        if medium:
+            selected.append(medium[0])
+        if complex_ex:
+            selected.append(complex_ex[0])
+
+        return selected[:NUM_FEW_SHOT_EXAMPLES]
+
+
+# For backward compatibility
+SQL_SYSTEM_PROMPT = get_sql_system_prompt()
 
 
 # =============================================================================
@@ -312,25 +776,41 @@ def validate_sql(query: str) -> SQLValidationResult:
     # =========================================================================
     # Layer 4: Schema Allow-List Validation
     # =========================================================================
-    
+
+    # Extract CTE names from WITH clause (these are valid virtual tables)
+    cte_names = set()
+    cte_pattern = r'\bWITH\s+(\w+)\s+AS\s*\('
+    cte_matches = re.findall(cte_pattern, query_upper, re.IGNORECASE)
+    for match in cte_matches:
+        cte_names.add(match.lower())
+
+    # Also handle multiple CTEs: WITH cte1 AS (...), cte2 AS (...)
+    multi_cte_pattern = r',\s*(\w+)\s+AS\s*\('
+    multi_cte_matches = re.findall(multi_cte_pattern, query_upper, re.IGNORECASE)
+    for match in multi_cte_matches:
+        cte_names.add(match.lower())
+
     # Extract table names from query using regex
     detected_tables = []
-    
+
     # Pattern to find tables in FROM and JOIN clauses
     from_pattern = r'\bFROM\s+(\w+)'
     join_pattern = r'\b(?:INNER\s+|LEFT\s+|RIGHT\s+|FULL\s+|CROSS\s+)?JOIN\s+(\w+)'
-    
+
     for pattern in [from_pattern, join_pattern]:
         matches = re.findall(pattern, query_upper)
         for match in matches:
             table_lower = match.lower()
             if table_lower not in detected_tables:
                 detected_tables.append(table_lower)
-    
-    # Validate tables against allow-list
+
+    # Validate tables against allow-list (excluding CTE names)
     allowed_tables_lower = [t.lower() for t in ALLOWED_TABLES.keys()]
-    
+
     for table in detected_tables:
+        # Skip CTE names - they are valid virtual tables defined in the query
+        if table in cte_names:
+            continue
         if table not in allowed_tables_lower:
             return SQLValidationResult(
                 is_valid=False,
@@ -364,31 +844,6 @@ def validate_sql(query: str) -> SQLValidationResult:
 # =============================================================================
 # SQL Query Chain
 # =============================================================================
-
-# System prompt for SQL generation
-SQL_SYSTEM_PROMPT = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid SQLite queries.
-
-{schema_info}
-
-CRITICAL SECURITY RULES:
-1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
-2. Use ONLY the tables and columns shown in the schema above.
-3. For date comparisons, use SQLite date format (YYYY-MM-DD).
-4. Return ONLY the SQL query without any explanation, markdown formatting, or code blocks.
-5. Do not use subqueries that attempt to access system tables.
-6. Use proper JOIN syntax when combining data from multiple tables.
-7. Use meaningful column aliases for calculated fields.
-8. For aggregations, always include appropriate GROUP BY clauses.
-
-DATABASE-SPECIFIC NOTES:
-- This is SQLite, not PostgreSQL or MySQL
-- Date functions: Use date(), strftime(), datetime() for date operations
-- String functions: Use || for concatenation, LIKE for pattern matching
-- Boolean values: SQLite uses 0 and 1 for false/true
-
-When the user asks a question, generate a single, valid SQLite SELECT query that answers it.
-Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
-
 
 def get_llm(
     api_key: Optional[str] = None,
@@ -481,16 +936,62 @@ def get_llm(
     return ChatOpenAI(**llm_kwargs)
 
 
-def create_sql_generation_prompt() -> ChatPromptTemplate:
-    """Create the prompt template for SQL generation."""
-    
+def create_sql_generation_prompt(
+    examples: Optional[List[SQLExample]] = None,
+    use_few_shot: bool = True
+) -> ChatPromptTemplate:
+    """
+    Create the prompt template for SQL generation with few-shot examples.
+
+    Args:
+        examples: Optional list of SQLExample objects. If not provided and use_few_shot=True,
+                  a default set will be used.
+        use_few_shot: Whether to include few-shot examples in the prompt
+
+    Returns:
+        ChatPromptTemplate configured for SQL generation
+    """
     schema_info = get_schema_for_prompt()
-    system_content = SQL_SYSTEM_PROMPT.format(schema_info=schema_info)
-    
+    system_prompt = get_sql_system_prompt()
+
+    # Format few-shot examples
+    if use_few_shot:
+        if examples is None:
+            # Get a default set of examples
+            examples = get_few_shot_examples()[:NUM_FEW_SHOT_EXAMPLES]
+        few_shot_str = format_few_shot_examples(examples)
+    else:
+        few_shot_str = ""
+
+    system_content = system_prompt.format(
+        schema_info=schema_info,
+        few_shot_examples=few_shot_str
+    )
+
     return ChatPromptTemplate.from_messages([
         ("system", system_content),
         ("human", "{question}")
     ])
+
+
+def create_dynamic_prompt_for_question(question: str) -> ChatPromptTemplate:
+    """
+    Create a prompt template dynamically selected examples for a specific question.
+
+    This function selects the most relevant examples based on the user's
+    question using semantic similarity or keyword matching.
+
+    Args:
+        question: User's natural language question
+
+    Returns:
+        ChatPromptTemplate with relevant few-shot examples
+    """
+    # Select relevant examples
+    relevant_examples = select_examples_for_question(question)
+
+    # Create prompt with selected examples
+    return create_sql_generation_prompt(examples=relevant_examples)
 
 
 def extract_sql_from_response(response: str) -> str:
@@ -527,7 +1028,7 @@ def execute_sql_safely(sql: str) -> Tuple[bool, pd.DataFrame, str]:
     Execute a validated SQL query safely with read-only connection.
     
     Security measures:
-    1. Uses read-only database connection
+    1. Uses read-only database connection (SQLAlchemy engine)
     2. Enforces row limit to prevent memory overload
     3. Sanitizes error messages to prevent information leakage
     
@@ -541,12 +1042,18 @@ def execute_sql_safely(sql: str) -> Tuple[bool, pd.DataFrame, str]:
         # Enforce row limit before execution
         safe_sql = enforce_row_limit(sql, MAX_ROWS_LIMIT)
         
-        # Get read-only connection
-        conn = get_db_connection(read_only=True)
+        # Get read-only SQLAlchemy engine
+        engine = get_db_engine(read_only=True)
         
-        # Execute query with row limit
-        df = pd.read_sql_query(safe_sql, conn)
-        conn.close()
+        # For PostgreSQL with custom schema, set search_path
+        if DB_TYPE == DatabaseType.POSTGRESQL and PG_SCHEMA != "public":
+            with engine.connect() as conn:
+                # Set search_path to include custom schema
+                conn.execute(text(f"SET search_path TO {PG_SCHEMA}, public"))
+                df = pd.read_sql_query(safe_sql, conn)
+        else:
+            # Execute query with row limit
+            df = pd.read_sql_query(safe_sql, engine)
         
         # Double-check row count (belt and suspenders)
         if len(df) > MAX_ROWS_LIMIT:
@@ -577,6 +1084,9 @@ class QueryResult:
     error_message: Optional[str] = None
     retry_count: int = 0
     validation_details: Optional[SQLValidationResult] = None
+    log_id: Optional[int] = None  # ID of the query log entry
+    execution_time_ms: Optional[int] = None  # Query execution time in milliseconds
+    from_cache: bool = False  # Whether the result was retrieved from cache
 
 
 # =============================================================================
@@ -625,6 +1135,9 @@ def run_query(
     Returns:
         QueryResult containing the SQL, dataframe, and status
     """
+    import time
+    start_time = time.time()
+    
     # =========================================================================
     # Security Check 1: Input Sanitization
     # =========================================================================
@@ -644,7 +1157,26 @@ def run_query(
     clean_question = sanitization.sanitized_input
     
     # =========================================================================
-    # Security Check 2: Rate Limiting
+    # Step 2: Check Cache (before rate limiting to save API calls)
+    # =========================================================================
+    cached_result = _cache.get(clean_question)
+    if cached_result is not None:
+        df, sql, success = cached_result
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Return cached result
+        return QueryResult(
+            success=success,
+            sql_query=sql,
+            dataframe=df,
+            retry_count=0,
+            log_id=None,  # Cached results don't get new log IDs
+            execution_time_ms=execution_time_ms,
+            from_cache=True  # Flag to indicate cache hit
+        )
+    
+    # =========================================================================
+    # Security Check 3: Rate Limiting
     # =========================================================================
     rate_check = check_rate_limit(user_id)
     if not rate_check.is_allowed:
@@ -676,12 +1208,15 @@ def run_query(
                 error_message=str(e)
             )
     
-    # Create the prompt template
-    prompt = create_sql_generation_prompt()
+    # Create the prompt template with dynamic few-shot examples
+    prompt = create_dynamic_prompt_for_question(clean_question)
     
     retry_count = 0
     last_error = ""
     last_sql = ""
+    
+    # Get database-specific syntax hint for retries
+    db_syntax = "PostgreSQL" if DB_TYPE == DatabaseType.POSTGRESQL else "SQLite"
     
     while retry_count <= MAX_RETRIES:
         try:
@@ -695,8 +1230,15 @@ def run_query(
                 raw_response = chain.invoke({"question": user_question})
             else:
                 # Retry attempt - include error feedback for self-correction
+                # Use the same few-shot examples as the original prompt
+                relevant_examples = select_examples_for_question(clean_question)
+                few_shot_str = format_few_shot_examples(relevant_examples)
+                
                 retry_prompt = ChatPromptTemplate.from_messages([
-                    ("system", SQL_SYSTEM_PROMPT.format(schema_info=get_schema_for_prompt())),
+                    ("system", get_sql_system_prompt().format(
+                        schema_info=get_schema_for_prompt(),
+                        few_shot_examples=few_shot_str
+                    )),
                     ("human", """Previous attempt generated this SQL:
 ```sql
 {last_sql}
@@ -709,14 +1251,16 @@ Please generate a CORRECTED SQL query for: {question}
 Remember:
 1. Only SELECT statements allowed
 2. Use exact table/column names from schema
-3. Valid SQLite syntax only"""),
+3. Valid {db_syntax} syntax only
+4. Refer to the examples above for correct syntax patterns"""),
                 ])
                 
                 chain = retry_prompt | llm | StrOutputParser()
                 raw_response = chain.invoke({
                     "question": user_question,
                     "last_sql": last_sql,
-                    "error": last_error
+                    "error": last_error,
+                    "db_syntax": db_syntax
                 })
             
             # Extract SQL from response
@@ -758,12 +1302,34 @@ Remember:
             success, df, error = execute_sql_safely(validation_result.cleaned_sql)
             
             if success:
+                # Calculate execution time
+                execution_time_ms = int((time.time() - start_time) * 1000)
+                
+                # Cache the successful result
+                _cache.set(
+                    question=clean_question,
+                    sql=validation_result.cleaned_sql,
+                    df=df,
+                    success=True
+                )
+                
+                # Log successful query to database
+                log_id = log_query_to_db(
+                    user_question=user_question,
+                    generated_sql=validation_result.cleaned_sql,
+                    success=True,
+                    row_count=len(df),
+                    execution_time_ms=execution_time_ms
+                )
+                
                 return QueryResult(
                     success=True,
                     sql_query=validation_result.cleaned_sql,
                     dataframe=df,
                     retry_count=retry_count,
-                    validation_details=validation_result
+                    validation_details=validation_result,
+                    log_id=log_id,
+                    execution_time_ms=execution_time_ms
                 )
             else:
                 # Execution failed - prepare for retry
@@ -771,12 +1337,26 @@ Remember:
                 retry_count += 1
                 
                 if retry_count > MAX_RETRIES:
+                    # Calculate execution time
+                    execution_time_ms = int((time.time() - start_time) * 1000)
+                    
+                    # Log failed query
+                    log_id = log_query_to_db(
+                        user_question=user_question,
+                        generated_sql=sql_query,
+                        success=False,
+                        error_message=error,
+                        execution_time_ms=execution_time_ms
+                    )
+                    
                     return QueryResult(
                         success=False,
                         sql_query=sql_query,
                         error_message=f"Query execution failed after {MAX_RETRIES} retries. Last error: {error}",
                         retry_count=retry_count,
-                        validation_details=validation_result
+                        validation_details=validation_result,
+                        log_id=log_id,
+                        execution_time_ms=execution_time_ms
                     )
                 
         except Exception as e:
@@ -784,17 +1364,42 @@ Remember:
             last_error = str(e)
             
             if retry_count > MAX_RETRIES:
+                # Calculate execution time
+                execution_time_ms = int((time.time() - start_time) * 1000)
+                
+                # Log failed query
+                log_id = log_query_to_db(
+                    user_question=user_question,
+                    generated_sql=last_sql if last_sql else None,
+                    success=False,
+                    error_message=str(e),
+                    execution_time_ms=execution_time_ms
+                )
+                
                 return QueryResult(
                     success=False,
                     error_message=f"Unexpected error after {MAX_RETRIES} retries: {str(e)}",
-                    retry_count=retry_count
+                    retry_count=retry_count,
+                    log_id=log_id,
+                    execution_time_ms=execution_time_ms
                 )
     
     # Should not reach here, but return failure if we do
+    execution_time_ms = int((time.time() - start_time) * 1000)
+    log_id = log_query_to_db(
+        user_question=user_question,
+        generated_sql=last_sql if last_sql else None,
+        success=False,
+        error_message="Maximum retries exceeded",
+        execution_time_ms=execution_time_ms
+    )
+    
     return QueryResult(
         success=False,
         error_message="Maximum retries exceeded",
-        retry_count=retry_count
+        retry_count=retry_count,
+        log_id=log_id,
+        execution_time_ms=execution_time_ms
     )
 
 
@@ -806,7 +1411,8 @@ def get_table_info() -> str:
     """
     Get formatted table information for debugging/display.
     """
-    db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+    conn_str = get_connection_string(read_only=True)
+    db = SQLDatabase.from_uri(conn_str)
     return db.get_table_info()
 
 
@@ -829,6 +1435,120 @@ Error: {result.error_message}
 SQL attempted: {result.sql_query}
 Retries: {result.retry_count}
 """
+
+
+# =============================================================================
+# Data Insights Function
+# =============================================================================
+
+def generate_data_insights(
+    df: pd.DataFrame,
+    question: str,
+    llm: Optional[BaseChatModel] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: str = "gpt-4o",
+    config: Optional[LLMConfig] = None
+) -> str:
+    """
+    Generate natural language insights from a DataFrame using the LLM.
+    
+    This function analyzes the data and provides key trends, patterns,
+    and anomalies in an easy-to-understand format.
+    
+    Args:
+        df: The DataFrame to analyze
+        question: The original user question (for context)
+        llm: Optional pre-configured LLM instance
+        api_key: API key override
+        base_url: Custom endpoint URL
+        model: Model name (default: gpt-4o)
+        config: LLMConfig instance
+        
+    Returns:
+        String containing the insights in bullet point format
+    """
+    if df is None or df.empty:
+        return "No data available to analyze."
+    
+    # Initialize LLM if not provided
+    if llm is None:
+        try:
+            llm = get_llm(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                config=config
+            )
+        except ValueError as e:
+            return f"Unable to generate insights: {str(e)}"
+    
+    # Prepare data summary for the LLM
+    try:
+        # Get head of data
+        head_str = df.head(10).to_string()
+        
+        # Get describe for numeric columns
+        describe_str = ""
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        if numeric_cols:
+            describe_str = df[numeric_cols].describe().to_string()
+        
+        # Get info about columns
+        col_info = []
+        for col in df.columns:
+            dtype = str(df[col].dtype)
+            unique = df[col].nunique()
+            nulls = df[col].isnull().sum()
+            col_info.append(f"  - {col}: {dtype}, {unique} unique values, {nulls} nulls")
+        
+        col_info_str = "\n".join(col_info)
+        
+        # Create the prompt
+        insights_prompt = f"""Act as a data analyst. Analyze the following data and provide key insights.
+
+**Original Question:** {question}
+
+**Data Summary:**
+- Total rows: {len(df)}
+- Total columns: {len(df.columns)}
+- Columns:
+{col_info_str}
+
+**First 10 rows:**
+```
+{head_str}
+```
+
+**Statistical Summary:**
+```
+{describe_str}
+```
+
+Based on this data, provide exactly 3 key insights in bullet point format. Focus on:
+1. The most significant trend or pattern
+2. Any notable outliers or anomalies
+3. Actionable business recommendations
+
+Format your response as:
+• [Insight 1]
+• [Insight 2]
+• [Insight 3]
+"""
+        
+        # Create prompt template and invoke LLM
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert data analyst who provides clear, actionable insights from data. Be concise and specific."),
+            ("human", "{prompt_text}")
+        ])
+        
+        chain = prompt | llm | StrOutputParser()
+        insights = chain.invoke({"prompt_text": insights_prompt})
+        
+        return insights
+        
+    except Exception as e:
+        return f"Error generating insights: {str(e)}"
 
 
 # =============================================================================
@@ -938,28 +1658,50 @@ def test_sql_generation():
 
 
 def show_llm_config():
-    """Display current LLM configuration."""
+    """Display current LLM and database configuration."""
     print("\n" + "=" * 80)
-    print("LLM CONFIGURATION")
+    print("CONFIGURATION")
     print("=" * 80)
     
+    # Database config
+    print(f"\n  Database Type: {DB_TYPE.value}")
+    if DB_TYPE == DatabaseType.POSTGRESQL:
+        from database_setup import PG_HOST, PG_PORT, PG_NAME, PG_USER
+        print(f"  Database Host: {PG_HOST}:{PG_PORT}")
+        print(f"  Database Name: {PG_NAME}")
+        print(f"  Database User: {PG_USER}")
+    
+    # LLM config
     config = LLMConfig.from_env()
     
-    print(f"\n  Provider: {config.get_provider_info()}")
-    print(f"  Model: {config.model}")
+    print(f"\n  LLM Provider: {config.get_provider_info()}")
+    print(f"  LLM Model: {config.model}")
     print(f"  Temperature: {config.temperature}")
     print(f"  Max Tokens: {config.max_tokens}")
     print(f"  API Key: {'✓ Set' if config.api_key else '✗ Not set'}")
     print(f"  Base URL: {config.base_url or 'Default (OpenAI)'}")
     
-    print("\n  Predefined Providers:")
+    # Few-shot config
+    print(f"\n  Few-Shot Prompting:")
+    print(f"    Dynamic Examples: {'Enabled' if ENABLE_DYNAMIC_EXAMPLES else 'Disabled'}")
+    print(f"    Number of Examples: {NUM_FEW_SHOT_EXAMPLES}")
+    print(f"    Min Similarity: {MIN_EXAMPLE_SIMILARITY}")
+    examples = get_few_shot_examples()
+    print(f"    Total Examples Available: {len(examples)}")
+    
+    print("\n  Predefined LLM Providers:")
     for name, cfg in LLM_PROVIDERS.items():
         print(f"    - {name}: {cfg.base_url or 'OpenAI default'}")
     
     print("\n  Environment Variables:")
+    print("    DB_TYPE - 'sqlite' or 'postgresql'")
+    print("    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD - PostgreSQL connection")
     print("    LLM_API_KEY / OPENAI_API_KEY - API key")
     print("    LLM_BASE_URL - Custom endpoint URL")
     print("    LLM_MODEL - Model name")
+    print("    ENABLE_DYNAMIC_EXAMPLES - Enable semantic similarity (true/false)")
+    print("    NUM_FEW_SHOT_EXAMPLES - Number of examples in prompt (default: 3)")
+    print("    MIN_EXAMPLE_SIMILARITY - Minimum similarity threshold (default: 0.3)")
 
 
 # =============================================================================
@@ -973,7 +1715,7 @@ if __name__ == "__main__":
     print("NL-BI Dashboard - SQL Chain Module Tests")
     print("=" * 80)
     
-    # Show LLM configuration
+    # Show configuration
     show_llm_config()
     
     # Run validation tests
