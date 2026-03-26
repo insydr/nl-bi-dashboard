@@ -11,13 +11,14 @@ Features:
 - Dynamic schema loading for LLM context
 - Self-correction retry mechanism (max 2 retries)
 - Read-only enforcement at multiple levels
+- Multi-database support (SQLite, PostgreSQL)
 
 Security Architecture (Defense in Depth):
 1. SQL Parser Validation (sqlparse) - Validates SQL structure
 2. Keyword Blocklist (regex) - Blocks destructive commands
 3. Statement Type Check - Only SELECT statements allowed
 4. Schema Allow-List - Only permitted tables/columns
-5. Read-Only DB Connection - SQLite URI mode enforces read-only
+5. Read-Only DB Connection - SQLite URI mode or PostgreSQL read-only user
 """
 
 import re
@@ -46,11 +47,13 @@ from pydantic import BaseModel, Field
 
 # Local imports
 from database_setup import (
-    get_db_connection,
+    get_db_engine,
     get_schema_for_prompt,
     ALLOWED_TABLES,
     BLOCKED_KEYWORDS,
-    DB_PATH
+    DB_TYPE,
+    DatabaseType,
+    get_connection_string
 )
 
 # Security module imports
@@ -172,6 +175,72 @@ LLM_PROVIDERS = {
         model="auto"
     ),
 }
+
+
+# =============================================================================
+# Database-Specific SQL Prompts
+# =============================================================================
+
+SQL_SYSTEM_PROMPT_SQLITE = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid SQLite queries.
+
+{schema_info}
+
+CRITICAL SECURITY RULES:
+1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
+2. Use ONLY the tables and columns shown in the schema above.
+3. For date comparisons, use SQLite date format (YYYY-MM-DD).
+4. Return ONLY the SQL query without any explanation, markdown formatting, or code blocks.
+5. Do not use subqueries that attempt to access system tables.
+6. Use proper JOIN syntax when combining data from multiple tables.
+7. Use meaningful column aliases for calculated fields.
+8. For aggregations, always include appropriate GROUP BY clauses.
+
+DATABASE-SPECIFIC NOTES (SQLite):
+- This is SQLite, not PostgreSQL or MySQL
+- Date functions: Use date(), strftime(), datetime() for date operations
+- String functions: Use || for concatenation, LIKE for pattern matching
+- Boolean values: SQLite uses 0 and 1 for false/true
+- Use LIMIT for row restrictions
+
+When the user asks a question, generate a single, valid SQLite SELECT query that answers it.
+Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
+
+SQL_SYSTEM_PROMPT_POSTGRESQL = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid PostgreSQL queries.
+
+{schema_info}
+
+CRITICAL SECURITY RULES:
+1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
+2. Use ONLY the tables and columns shown in the schema above.
+3. For date comparisons, use PostgreSQL date format (YYYY-MM-DD).
+4. Return ONLY the SQL query without any explanation, markdown formatting, or code blocks.
+5. Do not use subqueries that attempt to access system tables.
+6. Use proper JOIN syntax when combining data from multiple tables.
+7. Use meaningful column aliases for calculated fields.
+8. For aggregations, always include appropriate GROUP BY clauses.
+
+DATABASE-SPECIFIC NOTES (PostgreSQL):
+- This is PostgreSQL, not SQLite or MySQL
+- Date functions: Use DATE_TRUNC(), TO_CHAR(), EXTRACT(), NOW() for date operations
+- String functions: Use || for concatenation, ILIKE for case-insensitive pattern matching
+- Boolean values: Use TRUE/FALSE keywords
+- Use LIMIT for row restrictions
+- Use DOUBLE PRECISION for floating point calculations
+- Quote identifiers with double quotes if needed (e.g., "order")
+
+When the user asks a question, generate a single, valid PostgreSQL SELECT query that answers it.
+Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
+
+
+def get_sql_system_prompt() -> str:
+    """Get the appropriate SQL system prompt based on database type."""
+    if DB_TYPE == DatabaseType.POSTGRESQL:
+        return SQL_SYSTEM_PROMPT_POSTGRESQL
+    return SQL_SYSTEM_PROMPT_SQLITE
+
+
+# For backward compatibility
+SQL_SYSTEM_PROMPT = get_sql_system_prompt()
 
 
 # =============================================================================
@@ -365,31 +434,6 @@ def validate_sql(query: str) -> SQLValidationResult:
 # SQL Query Chain
 # =============================================================================
 
-# System prompt for SQL generation
-SQL_SYSTEM_PROMPT = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid SQLite queries.
-
-{schema_info}
-
-CRITICAL SECURITY RULES:
-1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
-2. Use ONLY the tables and columns shown in the schema above.
-3. For date comparisons, use SQLite date format (YYYY-MM-DD).
-4. Return ONLY the SQL query without any explanation, markdown formatting, or code blocks.
-5. Do not use subqueries that attempt to access system tables.
-6. Use proper JOIN syntax when combining data from multiple tables.
-7. Use meaningful column aliases for calculated fields.
-8. For aggregations, always include appropriate GROUP BY clauses.
-
-DATABASE-SPECIFIC NOTES:
-- This is SQLite, not PostgreSQL or MySQL
-- Date functions: Use date(), strftime(), datetime() for date operations
-- String functions: Use || for concatenation, LIKE for pattern matching
-- Boolean values: SQLite uses 0 and 1 for false/true
-
-When the user asks a question, generate a single, valid SQLite SELECT query that answers it.
-Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
-
-
 def get_llm(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -482,10 +526,11 @@ def get_llm(
 
 
 def create_sql_generation_prompt() -> ChatPromptTemplate:
-    """Create the prompt template for SQL generation."""
+    """Create the prompt template for SQL generation based on current database type."""
     
     schema_info = get_schema_for_prompt()
-    system_content = SQL_SYSTEM_PROMPT.format(schema_info=schema_info)
+    system_prompt = get_sql_system_prompt()
+    system_content = system_prompt.format(schema_info=schema_info)
     
     return ChatPromptTemplate.from_messages([
         ("system", system_content),
@@ -527,7 +572,7 @@ def execute_sql_safely(sql: str) -> Tuple[bool, pd.DataFrame, str]:
     Execute a validated SQL query safely with read-only connection.
     
     Security measures:
-    1. Uses read-only database connection
+    1. Uses read-only database connection (SQLAlchemy engine)
     2. Enforces row limit to prevent memory overload
     3. Sanitizes error messages to prevent information leakage
     
@@ -541,12 +586,11 @@ def execute_sql_safely(sql: str) -> Tuple[bool, pd.DataFrame, str]:
         # Enforce row limit before execution
         safe_sql = enforce_row_limit(sql, MAX_ROWS_LIMIT)
         
-        # Get read-only connection
-        conn = get_db_connection(read_only=True)
+        # Get read-only SQLAlchemy engine
+        engine = get_db_engine(read_only=True)
         
         # Execute query with row limit
-        df = pd.read_sql_query(safe_sql, conn)
-        conn.close()
+        df = pd.read_sql_query(safe_sql, engine)
         
         # Double-check row count (belt and suspenders)
         if len(df) > MAX_ROWS_LIMIT:
@@ -683,6 +727,9 @@ def run_query(
     last_error = ""
     last_sql = ""
     
+    # Get database-specific syntax hint for retries
+    db_syntax = "PostgreSQL" if DB_TYPE == DatabaseType.POSTGRESQL else "SQLite"
+    
     while retry_count <= MAX_RETRIES:
         try:
             # =================================================================
@@ -696,7 +743,7 @@ def run_query(
             else:
                 # Retry attempt - include error feedback for self-correction
                 retry_prompt = ChatPromptTemplate.from_messages([
-                    ("system", SQL_SYSTEM_PROMPT.format(schema_info=get_schema_for_prompt())),
+                    ("system", get_sql_system_prompt().format(schema_info=get_schema_for_prompt())),
                     ("human", """Previous attempt generated this SQL:
 ```sql
 {last_sql}
@@ -709,14 +756,15 @@ Please generate a CORRECTED SQL query for: {question}
 Remember:
 1. Only SELECT statements allowed
 2. Use exact table/column names from schema
-3. Valid SQLite syntax only"""),
+3. Valid {db_syntax} syntax only"""),
                 ])
                 
                 chain = retry_prompt | llm | StrOutputParser()
                 raw_response = chain.invoke({
                     "question": user_question,
                     "last_sql": last_sql,
-                    "error": last_error
+                    "error": last_error,
+                    "db_syntax": db_syntax
                 })
             
             # Extract SQL from response
@@ -806,7 +854,8 @@ def get_table_info() -> str:
     """
     Get formatted table information for debugging/display.
     """
-    db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+    conn_str = get_connection_string(read_only=True)
+    db = SQLDatabase.from_uri(conn_str)
     return db.get_table_info()
 
 
@@ -938,25 +987,36 @@ def test_sql_generation():
 
 
 def show_llm_config():
-    """Display current LLM configuration."""
+    """Display current LLM and database configuration."""
     print("\n" + "=" * 80)
-    print("LLM CONFIGURATION")
+    print("CONFIGURATION")
     print("=" * 80)
     
+    # Database config
+    print(f"\n  Database Type: {DB_TYPE.value}")
+    if DB_TYPE == DatabaseType.POSTGRESQL:
+        from database_setup import PG_HOST, PG_PORT, PG_NAME, PG_USER
+        print(f"  Database Host: {PG_HOST}:{PG_PORT}")
+        print(f"  Database Name: {PG_NAME}")
+        print(f"  Database User: {PG_USER}")
+    
+    # LLM config
     config = LLMConfig.from_env()
     
-    print(f"\n  Provider: {config.get_provider_info()}")
-    print(f"  Model: {config.model}")
+    print(f"\n  LLM Provider: {config.get_provider_info()}")
+    print(f"  LLM Model: {config.model}")
     print(f"  Temperature: {config.temperature}")
     print(f"  Max Tokens: {config.max_tokens}")
     print(f"  API Key: {'✓ Set' if config.api_key else '✗ Not set'}")
     print(f"  Base URL: {config.base_url or 'Default (OpenAI)'}")
     
-    print("\n  Predefined Providers:")
+    print("\n  Predefined LLM Providers:")
     for name, cfg in LLM_PROVIDERS.items():
         print(f"    - {name}: {cfg.base_url or 'OpenAI default'}")
     
     print("\n  Environment Variables:")
+    print("    DB_TYPE - 'sqlite' or 'postgresql'")
+    print("    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD - PostgreSQL connection")
     print("    LLM_API_KEY / OPENAI_API_KEY - API key")
     print("    LLM_BASE_URL - Custom endpoint URL")
     print("    LLM_MODEL - Model name")
@@ -973,7 +1033,7 @@ if __name__ == "__main__":
     print("NL-BI Dashboard - SQL Chain Module Tests")
     print("=" * 80)
     
-    # Show LLM configuration
+    # Show configuration
     show_llm_config()
     
     # Run validation tests
