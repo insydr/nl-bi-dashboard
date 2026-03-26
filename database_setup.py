@@ -51,8 +51,9 @@ from sqlalchemy.ext.declarative import declarative_base
 # Import python-dotenv for environment loading
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from .env file (use absolute path for Streamlit compatibility)
+_env_path = Path(__file__).parent / ".env"
+load_dotenv(_env_path)
 
 
 # =============================================================================
