@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 # LangChain imports
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder, FewShotPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableSequence
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
@@ -54,6 +54,14 @@ from database_setup import (
     DB_TYPE,
     DatabaseType,
     get_connection_string
+)
+
+# Few-shot examples for improved SQL generation
+from query_examples import (
+    get_few_shot_examples,
+    get_examples_for_langchain,
+    get_relevant_examples,
+    SQLExample
 )
 
 # Security module imports
@@ -178,12 +186,28 @@ LLM_PROVIDERS = {
 
 
 # =============================================================================
+# Few-Shot Example Selection Configuration
+# =============================================================================
+
+# Enable/disable dynamic example selection based on semantic similarity
+ENABLE_DYNAMIC_EXAMPLES = os.environ.get("ENABLE_DYNAMIC_EXAMPLES", "true").lower() == "true"
+
+# Number of examples to include in prompt (3-5 recommended to avoid token limits)
+NUM_FEW_SHOT_EXAMPLES = int(os.environ.get("NUM_FEW_SHOT_EXAMPLES", "3"))
+
+# Minimum similarity threshold for dynamic example selection
+MIN_EXAMPLE_SIMILARITY = float(os.environ.get("MIN_EXAMPLE_SIMILARITY", "0.3"))
+
+
+# =============================================================================
 # Database-Specific SQL Prompts
 # =============================================================================
 
 SQL_SYSTEM_PROMPT_SQLITE = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid SQLite queries.
 
 {schema_info}
+
+{few_shot_examples}
 
 CRITICAL SECURITY RULES:
 1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
@@ -201,6 +225,7 @@ DATABASE-SPECIFIC NOTES (SQLite):
 - String functions: Use || for concatenation, LIKE for pattern matching
 - Boolean values: SQLite uses 0 and 1 for false/true
 - Use LIMIT for row restrictions
+- For month-over-month comparisons, use window functions like LAG() with CTEs
 
 When the user asks a question, generate a single, valid SQLite SELECT query that answers it.
 Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
@@ -208,6 +233,8 @@ Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
 SQL_SYSTEM_PROMPT_POSTGRESQL = """You are an expert SQL assistant for an e-commerce database. Your task is to translate natural language questions into valid PostgreSQL queries.
 
 {schema_info}
+
+{few_shot_examples}
 
 CRITICAL SECURITY RULES:
 1. ONLY generate SELECT statements. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any data modification commands.
@@ -227,6 +254,7 @@ DATABASE-SPECIFIC NOTES (PostgreSQL):
 - Use LIMIT for row restrictions
 - Use DOUBLE PRECISION for floating point calculations
 - Quote identifiers with double quotes if needed (e.g., "order")
+- For month-over-month comparisons, use window functions like LAG() with CTEs
 
 When the user asks a question, generate a single, valid PostgreSQL SELECT query that answers it.
 Return ONLY the SQL query - no explanations, no markdown, no code blocks."""
@@ -237,6 +265,67 @@ def get_sql_system_prompt() -> str:
     if DB_TYPE == DatabaseType.POSTGRESQL:
         return SQL_SYSTEM_PROMPT_POSTGRESQL
     return SQL_SYSTEM_PROMPT_SQLITE
+
+
+def format_few_shot_examples(examples: List[SQLExample]) -> str:
+    """
+    Format few-shot examples for inclusion in the system prompt.
+
+    Args:
+        examples: List of SQLExample objects to format
+
+    Returns:
+        Formatted string with examples for the prompt
+    """
+    if not examples:
+        return ""
+
+    formatted = "HERE ARE SOME EXAMPLE QUERIES TO GUIDE YOU:\n\n"
+
+    for i, ex in enumerate(examples, 1):
+        formatted += f"Example {i}:\n"
+        formatted += f"Question: {ex.question}\n"
+        formatted += f"SQL: {ex.sql}\n\n"
+
+    return formatted
+
+
+def select_examples_for_question(question: str) -> List[SQLExample]:
+    """
+    Select the most relevant examples for a given question.
+
+    Uses dynamic selection if enabled, otherwise returns a curated set.
+
+    Args:
+        question: User's natural language question
+
+    Returns:
+        List of relevant SQLExample objects
+    """
+    if ENABLE_DYNAMIC_EXAMPLES:
+        # Use semantic similarity or keyword matching
+        return get_relevant_examples(
+            question,
+            top_k=NUM_FEW_SHOT_EXAMPLES,
+            min_similarity=MIN_EXAMPLE_SIMILARITY
+        )
+    else:
+        # Return a curated mix of examples
+        all_examples = get_few_shot_examples()
+        # Prioritize examples of varying complexity
+        simple = [ex for ex in all_examples if ex.complexity == "simple"]
+        medium = [ex for ex in all_examples if ex.complexity == "medium"]
+        complex_ex = [ex for ex in all_examples if ex.complexity == "complex"]
+
+        selected = []
+        if simple:
+            selected.append(simple[0])
+        if medium:
+            selected.append(medium[0])
+        if complex_ex:
+            selected.append(complex_ex[0])
+
+        return selected[:NUM_FEW_SHOT_EXAMPLES]
 
 
 # For backward compatibility
@@ -381,25 +470,41 @@ def validate_sql(query: str) -> SQLValidationResult:
     # =========================================================================
     # Layer 4: Schema Allow-List Validation
     # =========================================================================
-    
+
+    # Extract CTE names from WITH clause (these are valid virtual tables)
+    cte_names = set()
+    cte_pattern = r'\bWITH\s+(\w+)\s+AS\s*\('
+    cte_matches = re.findall(cte_pattern, query_upper, re.IGNORECASE)
+    for match in cte_matches:
+        cte_names.add(match.lower())
+
+    # Also handle multiple CTEs: WITH cte1 AS (...), cte2 AS (...)
+    multi_cte_pattern = r',\s*(\w+)\s+AS\s*\('
+    multi_cte_matches = re.findall(multi_cte_pattern, query_upper, re.IGNORECASE)
+    for match in multi_cte_matches:
+        cte_names.add(match.lower())
+
     # Extract table names from query using regex
     detected_tables = []
-    
+
     # Pattern to find tables in FROM and JOIN clauses
     from_pattern = r'\bFROM\s+(\w+)'
     join_pattern = r'\b(?:INNER\s+|LEFT\s+|RIGHT\s+|FULL\s+|CROSS\s+)?JOIN\s+(\w+)'
-    
+
     for pattern in [from_pattern, join_pattern]:
         matches = re.findall(pattern, query_upper)
         for match in matches:
             table_lower = match.lower()
             if table_lower not in detected_tables:
                 detected_tables.append(table_lower)
-    
-    # Validate tables against allow-list
+
+    # Validate tables against allow-list (excluding CTE names)
     allowed_tables_lower = [t.lower() for t in ALLOWED_TABLES.keys()]
-    
+
     for table in detected_tables:
+        # Skip CTE names - they are valid virtual tables defined in the query
+        if table in cte_names:
+            continue
         if table not in allowed_tables_lower:
             return SQLValidationResult(
                 is_valid=False,
@@ -525,17 +630,62 @@ def get_llm(
     return ChatOpenAI(**llm_kwargs)
 
 
-def create_sql_generation_prompt() -> ChatPromptTemplate:
-    """Create the prompt template for SQL generation based on current database type."""
-    
+def create_sql_generation_prompt(
+    examples: Optional[List[SQLExample]] = None,
+    use_few_shot: bool = True
+) -> ChatPromptTemplate:
+    """
+    Create the prompt template for SQL generation with few-shot examples.
+
+    Args:
+        examples: Optional list of SQLExample objects. If not provided and use_few_shot=True,
+                  a default set will be used.
+        use_few_shot: Whether to include few-shot examples in the prompt
+
+    Returns:
+        ChatPromptTemplate configured for SQL generation
+    """
     schema_info = get_schema_for_prompt()
     system_prompt = get_sql_system_prompt()
-    system_content = system_prompt.format(schema_info=schema_info)
-    
+
+    # Format few-shot examples
+    if use_few_shot:
+        if examples is None:
+            # Get a default set of examples
+            examples = get_few_shot_examples()[:NUM_FEW_SHOT_EXAMPLES]
+        few_shot_str = format_few_shot_examples(examples)
+    else:
+        few_shot_str = ""
+
+    system_content = system_prompt.format(
+        schema_info=schema_info,
+        few_shot_examples=few_shot_str
+    )
+
     return ChatPromptTemplate.from_messages([
         ("system", system_content),
         ("human", "{question}")
     ])
+
+
+def create_dynamic_prompt_for_question(question: str) -> ChatPromptTemplate:
+    """
+    Create a prompt template dynamically selected examples for a specific question.
+
+    This function selects the most relevant examples based on the user's
+    question using semantic similarity or keyword matching.
+
+    Args:
+        question: User's natural language question
+
+    Returns:
+        ChatPromptTemplate with relevant few-shot examples
+    """
+    # Select relevant examples
+    relevant_examples = select_examples_for_question(question)
+
+    # Create prompt with selected examples
+    return create_sql_generation_prompt(examples=relevant_examples)
 
 
 def extract_sql_from_response(response: str) -> str:
@@ -720,8 +870,8 @@ def run_query(
                 error_message=str(e)
             )
     
-    # Create the prompt template
-    prompt = create_sql_generation_prompt()
+    # Create the prompt template with dynamic few-shot examples
+    prompt = create_dynamic_prompt_for_question(clean_question)
     
     retry_count = 0
     last_error = ""
@@ -742,8 +892,15 @@ def run_query(
                 raw_response = chain.invoke({"question": user_question})
             else:
                 # Retry attempt - include error feedback for self-correction
+                # Use the same few-shot examples as the original prompt
+                relevant_examples = select_examples_for_question(clean_question)
+                few_shot_str = format_few_shot_examples(relevant_examples)
+                
                 retry_prompt = ChatPromptTemplate.from_messages([
-                    ("system", get_sql_system_prompt().format(schema_info=get_schema_for_prompt())),
+                    ("system", get_sql_system_prompt().format(
+                        schema_info=get_schema_for_prompt(),
+                        few_shot_examples=few_shot_str
+                    )),
                     ("human", """Previous attempt generated this SQL:
 ```sql
 {last_sql}
@@ -756,7 +913,8 @@ Please generate a CORRECTED SQL query for: {question}
 Remember:
 1. Only SELECT statements allowed
 2. Use exact table/column names from schema
-3. Valid {db_syntax} syntax only"""),
+3. Valid {db_syntax} syntax only
+4. Refer to the examples above for correct syntax patterns"""),
                 ])
                 
                 chain = retry_prompt | llm | StrOutputParser()
@@ -1010,6 +1168,14 @@ def show_llm_config():
     print(f"  API Key: {'✓ Set' if config.api_key else '✗ Not set'}")
     print(f"  Base URL: {config.base_url or 'Default (OpenAI)'}")
     
+    # Few-shot config
+    print(f"\n  Few-Shot Prompting:")
+    print(f"    Dynamic Examples: {'Enabled' if ENABLE_DYNAMIC_EXAMPLES else 'Disabled'}")
+    print(f"    Number of Examples: {NUM_FEW_SHOT_EXAMPLES}")
+    print(f"    Min Similarity: {MIN_EXAMPLE_SIMILARITY}")
+    examples = get_few_shot_examples()
+    print(f"    Total Examples Available: {len(examples)}")
+    
     print("\n  Predefined LLM Providers:")
     for name, cfg in LLM_PROVIDERS.items():
         print(f"    - {name}: {cfg.base_url or 'OpenAI default'}")
@@ -1020,6 +1186,9 @@ def show_llm_config():
     print("    LLM_API_KEY / OPENAI_API_KEY - API key")
     print("    LLM_BASE_URL - Custom endpoint URL")
     print("    LLM_MODEL - Model name")
+    print("    ENABLE_DYNAMIC_EXAMPLES - Enable semantic similarity (true/false)")
+    print("    NUM_FEW_SHOT_EXAMPLES - Number of examples in prompt (default: 3)")
+    print("    MIN_EXAMPLE_SIMILARITY - Minimum similarity threshold (default: 0.3)")
 
 
 # =============================================================================

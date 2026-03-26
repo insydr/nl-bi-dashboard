@@ -661,15 +661,55 @@ python database_setup.py
 - [x] Row limit enforcement
 - [x] Comprehensive test suite
 
-### Phase 2: Enhancements (Next)
+### Phase 2: Enhancements (Current) ✅
 
-- [ ] **Few-shot prompting** for improved SQL accuracy
+- [x] **Few-shot prompting** for improved SQL accuracy
+- [x] **CTE (Common Table Expression) support** in SQL validation
 - [ ] **Query history persistence** in SQLite
 - [ ] **"Explain this chart"** natural language insights
 - [ ] **Query caching** with Redis
 - [ ] **Custom schema support** for user databases
 - [ ] **Query templates** for common business questions
 - [ ] **Export to Excel** with formatting
+
+#### Few-Shot Prompting Feature
+
+The NL-BI Dashboard now uses **few-shot prompting** to guide the LLM in generating correct SQL for complex queries. This significantly improves accuracy for queries involving:
+
+- **Window functions** (LAG, LEAD, ROW_NUMBER)
+- **Common Table Expressions (CTEs)**
+- **Complex JOINs** with aggregations
+- **Month-over-month comparisons**
+- **Customer retention analysis**
+
+**How it works:**
+
+1. The system maintains a curated repository of 10 example queries covering various SQL patterns
+2. For each user question, the most relevant 2-3 examples are dynamically selected
+3. These examples are included in the LLM prompt to guide SQL generation
+4. Result: More accurate SQL, fewer retries, better handling of complex queries
+
+**Configuration:**
+
+```bash
+# Enable/disable dynamic example selection (default: true)
+ENABLE_DYNAMIC_EXAMPLES=true
+
+# Number of examples per prompt (default: 3)
+NUM_FEW_SHOT_EXAMPLES=3
+
+# Minimum similarity threshold for selection (default: 0.3)
+MIN_EXAMPLE_SIMILARITY=0.3
+```
+
+**Example queries now handled correctly:**
+
+| Complex Query | Technique Used |
+|---------------|----------------|
+| "Show month-over-month revenue growth" | LAG() window function with CTE |
+| "Customer retention by signup month" | LEFT JOIN + CASE WHEN + CTE |
+| "Products with low stock and high sales" | HAVING clause + COALESCE |
+| "Average order value by segment" | Multiple aggregations + ROUND |
 
 ### Phase 3: Production Migration
 
@@ -899,13 +939,17 @@ customers (1) ──────< (N) orders (1) ──────< (N) order_i
 ```
 nlbi-dashboard/
 ├── app.py               # Streamlit frontend UI
-├── sql_chain.py         # LangChain SQL chain and security validation
+├── sql_chain.py         # LangChain SQL chain with few-shot prompting
+├── query_examples.py    # Few-shot example repository (10 examples)
 ├── visualization.py     # Automatic chart generation engine
 ├── database_setup.py    # Database initialization and connection management
 ├── security.py          # Security hardening module
-├── test_queries.py      # Pytest test suite
+├── test_queries.py      # Pytest test suite for security/validation
+├── test_few_shot.py     # Few-shot prompting test suite
 ├── data/
 │   └── ecommerce.db     # SQLite database with sample e-commerce data
+├── screenshots/         # Production screenshots for documentation
+├── docker/              # Docker configuration for PostgreSQL
 ├── requirements.txt     # Python dependencies with versions
 ├── .env.example         # Environment configuration template
 ├── .gitignore           # Git ignore patterns
