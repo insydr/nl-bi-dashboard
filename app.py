@@ -34,13 +34,59 @@ from pathlib import Path
 # Import our modules
 from sql_chain import (
     run_query, QueryResult, LLMConfig, get_llm, show_llm_config,
-    generate_data_insights
+    generate_data_insights, get_cache_stats, clear_cache
 )
 from visualization import generate_chart, get_chart_recommendation, ChartType
 from database_setup import (
     get_recent_queries, update_query_feedback, ensure_query_logs_table,
-    get_query_stats
+    get_query_stats, get_db_engine, get_schema_for_prompt
 )
+
+
+# =============================================================================
+# Streamlit Caching (Performance Optimization)
+# =============================================================================
+
+@st.cache_resource
+def get_cached_llm(config: LLMConfig):
+    """
+    Get cached LLM instance.
+    
+    Uses @st.cache_resource because the LLM client is a stateful resource
+    that should be reused across sessions.
+    """
+    return get_llm(config=config)
+
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_cached_db_engine():
+    """
+    Get cached database engine.
+    
+    Uses @st.cache_data because the engine config is data that can be serialized.
+    """
+    return get_db_engine(read_only=True)
+
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_cached_schema():
+    """
+    Get cached database schema for LLM context.
+    
+    Uses @st.cache_data because schema rarely changes.
+    """
+    return get_schema_for_prompt()
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_cached_recent_queries(_limit: int = 10):
+    """
+    Get cached recent queries from database.
+    
+    Uses @st.cache_data with short TTL since history updates frequently.
+    Note: Uses underscore prefix for params that shouldn't affect caching.
+    """
+    return get_recent_queries(limit=_limit, success_only=True)
 
 
 # =============================================================================
@@ -344,8 +390,8 @@ def render_persisted_history():
     st.sidebar.markdown("### 📜 Recent Queries")
     
     try:
-        # Get recent queries from database
-        db_history = get_recent_queries(limit=10, success_only=True)
+        # Get recent queries from database (uses caching)
+        db_history = get_cached_recent_queries(_limit=10)
         
         if not db_history:
             st.sidebar.caption("No queries yet. Try asking a question!")
@@ -439,6 +485,11 @@ def render_result(result: QueryResult, question: str):
     success_msg = f"✅ Query executed successfully! ({len(result.dataframe)} rows)"
     if result.execution_time_ms:
         success_msg += f" in {result.execution_time_ms}ms"
+    
+    # Add cache indicator
+    if result.from_cache:
+        success_msg += " 📦 (from cache)"
+    
     st.success(success_msg)
     
     # Generate and display chart
@@ -576,6 +627,22 @@ def render_settings_panel():
         if stats["total_queries"] > 0:
             st.sidebar.markdown("**Session Stats:**")
             st.sidebar.caption(f"Queries: {stats['total_queries']} | Success: {stats['success_rate']}%")
+    except Exception:
+        pass
+    
+    # Show cache stats
+    try:
+        cache_stats = get_cache_stats()
+        if cache_stats["total_queries"] > 0:
+            st.sidebar.markdown("**Cache Stats:**")
+            st.sidebar.caption(f"Hit Rate: {cache_stats['hit_rate_percent']}%")
+            st.sidebar.caption(f"Hits: {cache_stats['hits']} | Misses: {cache_stats['misses']}")
+            
+            # Clear cache button
+            if st.sidebar.button("🗑️ Clear Cache", key="clear_cache_btn"):
+                clear_cache()
+                st.sidebar.success("Cache cleared!")
+                st.rerun()
     except Exception:
         pass
     

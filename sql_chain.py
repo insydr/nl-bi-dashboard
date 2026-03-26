@@ -28,6 +28,7 @@ import os
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass, field
 from enum import Enum
+from io import StringIO
 
 # LangChain imports
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder, FewShotPromptTemplate
@@ -91,6 +92,302 @@ MAX_RETRIES = 2
 
 # SQL statement types that are allowed
 ALLOWED_STATEMENT_TYPES = {"SELECT"}
+
+# =============================================================================
+# Semantic Cache Configuration
+# =============================================================================
+
+# Enable/disable caching (set via environment variable)
+ENABLE_CACHE = os.environ.get("ENABLE_CACHE", "true").lower() == "true"
+
+# Cache TTL in seconds (default: 1 hour)
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
+
+# Maximum cache entries
+MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "100"))
+
+# Minimum similarity threshold for semantic cache hits (0.0 to 1.0)
+# Lower values = more matches but potentially less relevant
+SEMANTIC_SIMILARITY_THRESHOLD = float(os.environ.get("SEMANTIC_SIMILARITY_THRESHOLD", "0.85"))
+
+
+# =============================================================================
+# Semantic Cache Implementation
+# =============================================================================
+
+@dataclass
+class CacheEntry:
+    """A cached query result."""
+    question: str
+    question_hash: str
+    sql: str
+    result_df_json: str  # Serialized DataFrame
+    success: bool
+    timestamp: float
+    hit_count: int = 0
+    column_names: List[str] = field(default_factory=list)
+
+
+class SemanticCache:
+    """
+    Semantic cache for SQL query results.
+    
+    Features:
+    - Exact match caching using question hash
+    - Optional semantic similarity matching (when sentence-transformers available)
+    - TTL-based expiration
+    - LRU eviction when max entries reached
+    - Cache statistics tracking
+    
+    Cache Flow:
+    1. Before calling LLM, check cache for similar questions
+    2. If found and not expired, return cached result
+    3. Otherwise, call LLM and cache the result
+    """
+    
+    def __init__(
+        self,
+        max_entries: int = MAX_CACHE_ENTRIES,
+        ttl_seconds: int = CACHE_TTL_SECONDS,
+        similarity_threshold: float = SEMANTIC_SIMILARITY_THRESHOLD
+    ):
+        self.max_entries = max_entries
+        self.ttl_seconds = ttl_seconds
+        self.similarity_threshold = similarity_threshold
+        self._cache: Dict[str, CacheEntry] = {}
+        self._access_order: List[str] = []  # For LRU eviction
+        self._embedding_model = None
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "total_queries": 0
+        }
+    
+    def _compute_hash(self, question: str) -> str:
+        """Compute a hash for the question."""
+        import hashlib
+        normalized = question.lower().strip()
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    
+    def _compute_embedding(self, text: str) -> Optional[List[float]]:
+        """
+        Compute embedding for semantic similarity.
+        
+        Returns None if sentence-transformers is not available.
+        """
+        if self._embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            except ImportError:
+                return None
+        
+        try:
+            embedding = self._embedding_model.encode(text)
+            return embedding.tolist()
+        except Exception:
+            return None
+    
+    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
+        """Compute cosine similarity between two vectors."""
+        import math
+        if len(vec1) != len(vec2):
+            return 0.0
+        
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = math.sqrt(sum(a * a for a in vec1))
+        norm2 = math.sqrt(sum(b * b for b in vec2))
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+    
+    def _is_expired(self, entry: CacheEntry) -> bool:
+        """Check if a cache entry has expired."""
+        import time
+        return (time.time() - entry.timestamp) > self.ttl_seconds
+    
+    def _evict_lru(self) -> None:
+        """Evict the least recently used entry."""
+        if not self._access_order:
+            return
+        
+        oldest_key = self._access_order.pop(0)
+        if oldest_key in self._cache:
+            del self._cache[oldest_key]
+            self._stats["evictions"] += 1
+    
+    def _update_access_order(self, key: str) -> None:
+        """Update the access order for LRU tracking."""
+        if key in self._access_order:
+            self._access_order.remove(key)
+        self._access_order.append(key)
+    
+    def get(self, question: str) -> Optional[Tuple[pd.DataFrame, str, bool]]:
+        """
+        Get cached result for a question.
+        
+        Args:
+            question: User's natural language question
+            
+        Returns:
+            Tuple of (DataFrame, SQL, success) if cache hit, None otherwise
+        """
+        if not ENABLE_CACHE:
+            return None
+        
+        self._stats["total_queries"] += 1
+        question_hash = self._compute_hash(question)
+        
+        # Check exact match first
+        if question_hash in self._cache:
+            entry = self._cache[question_hash]
+            
+            if not self._is_expired(entry):
+                # Cache hit!
+                entry.hit_count += 1
+                self._update_access_order(question_hash)
+                self._stats["hits"] += 1
+                
+                # Deserialize DataFrame
+                df = pd.read_json(StringIO(entry.result_df_json))
+                return df, entry.sql, entry.success
+            else:
+                # Expired, remove it
+                del self._cache[question_hash]
+                if question_hash in self._access_order:
+                    self._access_order.remove(question_hash)
+        
+        # Try semantic similarity (if available)
+        question_embedding = self._compute_embedding(question)
+        if question_embedding is not None:
+            best_match_key = None
+            best_similarity = 0.0
+            
+            for key, entry in self._cache.items():
+                if self._is_expired(entry):
+                    continue
+                
+                entry_embedding = self._compute_embedding(entry.question)
+                if entry_embedding:
+                    similarity = self._cosine_similarity(question_embedding, entry_embedding)
+                    if similarity > best_similarity and similarity >= self.similarity_threshold:
+                        best_similarity = similarity
+                        best_match_key = key
+            
+            if best_match_key:
+                entry = self._cache[best_match_key]
+                entry.hit_count += 1
+                self._update_access_order(best_match_key)
+                self._stats["hits"] += 1
+                
+                df = pd.read_json(StringIO(entry.result_df_json))
+                return df, entry.sql, entry.success
+        
+        # Cache miss
+        self._stats["misses"] += 1
+        return None
+    
+    def set(
+        self,
+        question: str,
+        sql: str,
+        df: pd.DataFrame,
+        success: bool
+    ) -> None:
+        """
+        Store a result in the cache.
+        
+        Args:
+            question: User's natural language question
+            sql: Generated SQL query
+            df: Result DataFrame
+            success: Whether the query succeeded
+        """
+        if not ENABLE_CACHE:
+            return
+        
+        import time
+        question_hash = self._compute_hash(question)
+        
+        # Check if we need to evict
+        while len(self._cache) >= self.max_entries:
+            self._evict_lru()
+        
+        # Serialize DataFrame
+        result_df_json = df.to_json(orient='records') if df is not None and not df.empty else "[]"
+        
+        # Create cache entry
+        entry = CacheEntry(
+            question=question,
+            question_hash=question_hash,
+            sql=sql,
+            result_df_json=result_df_json,
+            success=success,
+            timestamp=time.time(),
+            hit_count=0,
+            column_names=list(df.columns) if df is not None and not df.empty else []
+        )
+        
+        self._cache[question_hash] = entry
+        self._update_access_order(question_hash)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total = self._stats["hits"] + self._stats["misses"]
+        hit_rate = (self._stats["hits"] / total * 100) if total > 0 else 0
+        
+        return {
+            "hits": self._stats["hits"],
+            "misses": self._stats["misses"],
+            "evictions": self._stats["evictions"],
+            "total_queries": self._stats["total_queries"],
+            "hit_rate_percent": round(hit_rate, 2),
+            "cache_size": len(self._cache),
+            "max_entries": self.max_entries
+        }
+    
+    def clear(self) -> None:
+        """Clear the cache."""
+        self._cache.clear()
+        self._access_order.clear()
+    
+    def cleanup_expired(self) -> int:
+        """Remove all expired entries. Returns count of removed entries."""
+        import time
+        expired_keys = []
+        
+        for key, entry in self._cache.items():
+            if self._is_expired(entry):
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self._cache[key]
+            if key in self._access_order:
+                self._access_order.remove(key)
+        
+        return len(expired_keys)
+
+
+# Global cache instance
+_cache = SemanticCache()
+
+
+def get_cache() -> SemanticCache:
+    """Get the global cache instance."""
+    return _cache
+
+
+def clear_cache() -> None:
+    """Clear the global cache."""
+    _cache.clear()
+
+
+def get_cache_stats() -> Dict[str, Any]:
+    """Get cache statistics."""
+    return _cache.get_stats()
 
 
 # =============================================================================
@@ -777,6 +1074,7 @@ class QueryResult:
     validation_details: Optional[SQLValidationResult] = None
     log_id: Optional[int] = None  # ID of the query log entry
     execution_time_ms: Optional[int] = None  # Query execution time in milliseconds
+    from_cache: bool = False  # Whether the result was retrieved from cache
 
 
 # =============================================================================
@@ -847,7 +1145,26 @@ def run_query(
     clean_question = sanitization.sanitized_input
     
     # =========================================================================
-    # Security Check 2: Rate Limiting
+    # Step 2: Check Cache (before rate limiting to save API calls)
+    # =========================================================================
+    cached_result = _cache.get(clean_question)
+    if cached_result is not None:
+        df, sql, success = cached_result
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Return cached result
+        return QueryResult(
+            success=success,
+            sql_query=sql,
+            dataframe=df,
+            retry_count=0,
+            log_id=None,  # Cached results don't get new log IDs
+            execution_time_ms=execution_time_ms,
+            from_cache=True  # Flag to indicate cache hit
+        )
+    
+    # =========================================================================
+    # Security Check 3: Rate Limiting
     # =========================================================================
     rate_check = check_rate_limit(user_id)
     if not rate_check.is_allowed:
@@ -975,6 +1292,14 @@ Remember:
             if success:
                 # Calculate execution time
                 execution_time_ms = int((time.time() - start_time) * 1000)
+                
+                # Cache the successful result
+                _cache.set(
+                    question=clean_question,
+                    sql=validation_result.cleaned_sql,
+                    df=df,
+                    success=True
+                )
                 
                 # Log successful query to database
                 log_id = log_query_to_db(
